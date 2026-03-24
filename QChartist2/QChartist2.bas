@@ -449,15 +449,51 @@ Sub DetectTimeframe()
     QChart.TimeFrame = CLng(realTF)
 
     ' ── Remplir les buffers multi-TF depuis les données chargées ─────────────
-    ' QChart1440 : copie directe si le fichier est daily, sinon agrégation
-    ' QChart10080 : agrégation weekly (7 barres daily → 1 barre weekly)
-    ' QChart43200 : agrégation monthly
     Dim totalBarsLoaded As Long = UBound(QChart.History) + 1
 
-    ' QChart1440 : toujours rempli avec les données du fichier courant
-    ' (même si ce n'est pas du daily — sert de fallback)
-    ' QChart1440 : copie directe depuis QChart en ordre croissant (0=plus ancien)
-    ' avec calcul du timestamp Unix pour chaque barre
+    ' Copie directe vers le buffer du TF correspondant au fichier chargé
+    ' (1, 5, 15, 30, 60, 240 min)
+    Select Case QChart.TimeFrame
+        Case 1
+            ReDim QChart1.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart1.History(bi) = QChart.History(bi)
+            Next bi
+            QChart1.IsLoaded = 1 : QChart1.TimeFrame = 1
+        Case 5
+            ReDim QChart5.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart5.History(bi) = QChart.History(bi)
+            Next bi
+            QChart5.IsLoaded = 1 : QChart5.TimeFrame = 5
+        Case 15
+            ReDim QChart15.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart15.History(bi) = QChart.History(bi)
+            Next bi
+            QChart15.IsLoaded = 1 : QChart15.TimeFrame = 15
+        Case 30
+            ReDim QChart30.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart30.History(bi) = QChart.History(bi)
+            Next bi
+            QChart30.IsLoaded = 1 : QChart30.TimeFrame = 30
+        Case 60
+            ReDim QChart60.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart60.History(bi) = QChart.History(bi)
+            Next bi
+            QChart60.IsLoaded = 1 : QChart60.TimeFrame = 60
+        Case 240
+            ReDim QChart240.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart240.History(bi) = QChart.History(bi)
+            Next bi
+            QChart240.IsLoaded = 1 : QChart240.TimeFrame = 240
+    End Select
+
+    ' QChart1440 : copie directe (sert aussi de référence pour les indicateurs multi-TF)
+    ' QChart10080 (Weekly) et QChart43200 (Monthly) : agrégation
     ReDim QChart1440.History(totalBarsLoaded - 1)
     For bi As Long = 0 To totalBarsLoaded - 1
         QChart1440.History(bi).Dt   = QChart.History(bi).Dt
@@ -1078,16 +1114,51 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     ' ctx.mainChartH inclut RSI_PANEL_MARGIN pour que le cpp n'ait pas à connaître cette constante.
     ' Le cpp calcule : rTop = ctx.mainChartH + panelIndex * (panelH + panelGap)
     ctx.mainChartH = CLng(mainChartH) + RSI_PANEL_MARGIN
+
+    ' Buffers pré-alloués pour passer QChart1 au CVD (sub-TF volumes)
+    Static cvdVol1 (MAX_REF_BARS - 1) As Double
+    Static cvdCls1 (MAX_REF_BARS - 1) As Double
+    Static cvdOpn1 (MAX_REF_BARS - 1) As Double
+    Static cvdTS1  (MAX_REF_BARS - 1) As Double
+
     For i As Integer = 0 To ActiveCount - 1
         Dim defIdx As Long = ActivePanels(i).defIndex
         Dim def As IndicatorDef = indRegistry.defs(defIdx)
         If def.isPanel = 1 And def.drawPanel <> 0 Then
             Dim totalPanelCount As Long = CountPanels(defIdx)
             Dim pVMin As Double = 0.0, pVMax As Double = 100.0
+
+            ' ── CVD : injecter QChart1 comme sub-TF via ctx.ref* ─────────────
+            ctx.refHighs      = NULL : ctx.refLows    = NULL
+            ctx.refOpens      = NULL : ctx.refTimestamps = NULL
+            ctx.refCount      = 0   : ctx.refTFMinutes  = 0
+
+            If Trim(def.name) = "CVD" And QChart1.IsLoaded Then
+                Dim cvdN As Long = UBound(QChart1.History) + 1
+                If cvdN > MAX_REF_BARS Then cvdN = MAX_REF_BARS
+                For rj As Long = 0 To cvdN - 1
+                    cvdVol1(rj) = QChart1.History(rj).V   ' volume → refHighs
+                    cvdCls1(rj) = QChart1.History(rj).C   ' close  → refLows
+                    cvdOpn1(rj) = QChart1.History(rj).O   ' open   → refOpens
+                    cvdTS1 (rj) = QChart1.History(rj).Unix
+                Next rj
+                ctx.refHighs      = @cvdVol1(0)
+                ctx.refLows       = @cvdCls1(0)
+                ctx.refOpens      = @cvdOpn1(0)
+                ctx.refTimestamps = @cvdTS1(0)
+                ctx.refCount      = cvdN
+                ctx.refTFMinutes  = 1
+            End If
+
             def.drawPanel(g, hDC, @Closes(0), @Opens(0), @Highs(0), @Lows(0), @Volumes(0), @Weekdays(0), totalBars, _
                 ActivePanels(i).period, ActivePanels(i).param2, panelIdx, totalPanelCount, _
                 @ctx, CLng(RSI_PANEL_H), CLng(RSI_PANEL_GAP), CLng(RSI_CLOSE_BTN), _
                 @pVMin, @pVMax)
+
+            ' Réinitialiser ref après appel
+            ctx.refHighs = NULL : ctx.refLows = NULL : ctx.refOpens = NULL
+            ctx.refTimestamps = NULL : ctx.refCount = 0 : ctx.refTFMinutes = 0
+
             ' Mémoriser la géométrie + espace de valeurs pour les trendlines
             Dim pInnerH As Integer = RSI_PANEL_H - 20
             PanelGeoms(PanelGeomCount).rTop           = mainChartH + RSI_PANEL_MARGIN + panelIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
