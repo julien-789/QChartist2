@@ -490,25 +490,37 @@ Sub DetectTimeframe()
                 QChart240.History(bi) = QChart.History(bi)
             Next bi
             QChart240.IsLoaded = 1 : QChart240.TimeFrame = 240
+        Case 1440
+            ReDim QChart1440.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart1440.History(bi) = QChart.History(bi)
+            Next bi
+            QChart1440.IsLoaded = 1 : QChart1440.TimeFrame = 1440
+        Case 10080
+            ReDim QChart10080.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart10080.History(bi) = QChart.History(bi)
+            Next bi
+            QChart10080.IsLoaded = 1 : QChart10080.TimeFrame = 10080
+        Case 43200
+            ReDim QChart43200.History(totalBarsLoaded - 1)
+            For bi As Long = 0 To totalBarsLoaded - 1
+                QChart43200.History(bi) = QChart.History(bi)
+            Next bi
+            QChart43200.IsLoaded = 1 : QChart43200.TimeFrame = 43200
     End Select
 
-    ' QChart1440 : copie directe (sert aussi de référence pour les indicateurs multi-TF)
-    ' QChart10080 (Weekly) et QChart43200 (Monthly) : agrégation
-    ReDim QChart1440.History(totalBarsLoaded - 1)
-    For bi As Long = 0 To totalBarsLoaded - 1
-        QChart1440.History(bi).Dt   = QChart.History(bi).Dt
-        QChart1440.History(bi).Tm   = QChart.History(bi).Tm
-        QChart1440.History(bi).O    = QChart.History(bi).O
-        QChart1440.History(bi).H    = QChart.History(bi).H
-        QChart1440.History(bi).L    = QChart.History(bi).L
-        QChart1440.History(bi).C    = QChart.History(bi).C
-        QChart1440.History(bi).V    = QChart.History(bi).V
-        QChart1440.History(bi).Unix = QChart.History(bi).Unix
-    Next bi
-    QChart1440.IsLoaded = 1
+    ' QChart1440 / QChart10080 / QChart43200 via agrégation :
+    ' Remplir UNIQUEMENT si le fichier chargé est exactement Daily (1440)
+    ' → agrège weekly et monthly depuis les barres daily
+    ' Si on charge directement du 10080 ou 43200, la copie directe ci-dessus suffit
+    ' Si on charge du H1 ou moins, on ne touche pas à ces buffers
+    If QChart.TimeFrame = 1440 Then
+    ' QChart1440 déjà rempli par Case 1440 ci-dessus — on agrège weekly et monthly
+    ' seulement si ces buffers n'ont pas déjà été chargés depuis un fichier dédié
 
-    ' QChart10080 (Weekly) : agréger les barres par semaine
-    ' On groupe les barres par numéro de semaine ISO (lundi au dimanche)
+    ' QChart10080 (Weekly) : agréger depuis le daily SAUF si déjà chargé directement
+    If Not QChart10080.IsLoaded Then
     Dim wkH As Double = -1e30, wkL As Double = 1e30
     Dim wkO As Double = 0, wkC As Double = 0, wkV As Long = 0
     Dim wkDt As String = "", wkTm As String = "", wkUnix As Double = 0
@@ -568,8 +580,10 @@ Sub DetectTimeframe()
         ReDim Preserve QChart10080.History(wkIdx - 1)
         QChart10080.IsLoaded = 1
     End If
+    End If ' Not QChart10080.IsLoaded
 
-    ' QChart43200 (Monthly) : agréger les barres par mois
+    ' QChart43200 (Monthly) : agréger depuis le daily SAUF si déjà chargé directement
+    If Not QChart43200.IsLoaded Then
     Dim mnH As Double = -1e30, mnL As Double = 1e30
     Dim mnO As Double = 0, mnC As Double = 0, mnV As Long = 0
     Dim mnDt As String = "", mnTm As String = "", mnUnix As Double = 0
@@ -626,7 +640,9 @@ Sub DetectTimeframe()
         ReDim Preserve QChart43200.History(mnIdx - 1)
         QChart43200.IsLoaded = 1
     End If
-    ' ── Avertissement si timeframe non standard ───────────────────────────────
+    End If ' Not QChart43200.IsLoaded
+
+    End If ' QChart.TimeFrame = 1440
     Select Case QChart.TimeFrame
         Case 1, 5, 15, 30, 60, 240, 1440, 10080, 43200
             ' Timeframe standard — OK

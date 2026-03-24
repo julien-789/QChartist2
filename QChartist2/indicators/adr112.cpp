@@ -36,7 +36,7 @@
 using namespace Gdiplus;
 using namespace Gdiplus::DllExports;
 
-static const int MAX_B    = 4096;
+static const int MAX_B    = 8192;
 static const int MAX_REF  = 4096;
 
 /* ── iBarShift : recherche par bisection ──────────────────────────────── */
@@ -115,7 +115,7 @@ static void ADR_DrawOverlay(
     int count, int period, int param2, int panelIndex,
     const ChartCtx* ctx, int closeBtnSz, const unsigned int* /*colors*/)
 {
-    if (count > MAX_B) return;
+    if (count > MAX_B) count = MAX_B;
 
     float  oriX=ctx->oriX, oriY=ctx->oriY;
     float  stepX=ctx->stepX, lenX=ctx->lenX;
