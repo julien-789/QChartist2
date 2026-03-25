@@ -7,12 +7,30 @@
 
 #inclib "gdiplus"
 #inclib "comctl32"
+#inclib "shell32"
 
 Using GDIPLUS
 
 ' --- Constantes ---
 Const SCROLL_H = 40
 #define ID_MENU_OPEN      1001
+#define ID_MENU_DATASOURCE 1002
+#define ID_DS_SYMBOL      4001
+#define ID_DS_STARTDATE   4002
+#define ID_DS_ENDDATE     4003
+#define ID_DS_TF          4004
+#define ID_DS_APIKEY      4005
+#define ID_DS_GETCHART    4006
+#define ID_DS_STATUS      4007
+#define ID_DS_TIMER       4008
+#define ID_DS_APIKEYS_BTN 4009
+#define ID_DS_SOURCE      4010   ' combobox source de données
+' Champs de la fenêtre API Keys
+#define ID_AK_TIINGO      4101
+#define ID_AK_FINNHUB     4102
+#define ID_AK_ALPHAVANTAGE 4103
+#define ID_AK_TWELVEDATA  4104
+#define ID_AK_SAVE        4105
 #define ID_TOOL_SELECT    2001
 #define ID_TOOL_LINE      2002
 #define ID_TOOL_ERASER    2003
@@ -233,6 +251,35 @@ Dim Shared QChart10080 As QChartType  ' 10080 min (Weekly)
 Dim Shared QChart43200 As QChartType  ' 43200 min (Monthly)
 Dim Shared hScroll As HWND
 Dim Shared hToolbar As HWND
+
+' ── Data Source (Tiingo) ──────────────────────────────────────────────────────
+Dim Shared hDSWin       As HWND   ' fenêtre Data Source
+Dim Shared hDSSource    As HWND   ' combobox source de données
+Dim Shared hWndMain     As HWND   ' handle fenêtre principale (pour SetTimer depuis DataSourceProc)
+' ── Fenêtre API Keys ─────────────────────────────────────────────────────────
+Dim Shared hAKWin       As HWND
+Dim Shared hAKTiingo    As HWND
+Dim Shared hAKFinnhub   As HWND
+Dim Shared hAKAlpha     As HWND
+Dim Shared hAKTwelve    As HWND
+' Clés API stockées en mémoire
+Dim Shared gKeyTiingo      As String
+Dim Shared gKeyFinnhub     As String
+Dim Shared gKeyAlpha       As String
+Dim Shared gKeyTwelvedata  As String
+Dim Shared hDSSymbol    As HWND
+Dim Shared hDSStartDate As HWND
+Dim Shared hDSEndDate   As HWND
+Dim Shared hDSTF        As HWND   ' combobox timeframe
+Dim Shared hDSApiKey    As HWND
+Dim Shared hDSGetChart  As HWND
+Dim Shared hDSStatus    As HWND   ' label statut
+Dim Shared hDSTimer     As HWND   ' timer de polling
+Dim Shared dsTimerActive As Integer = 0
+Dim Shared dsTimerCount  As Integer = 0
+Dim Shared dsActiveSource As Integer = 0  ' 0=Tiingo, 1=Yahoo, ...
+Dim Shared dsPendingCSV  As String
+Dim Shared dsBusyFile    As String
 Dim Shared hBtnIndicators As HWND
 Dim Shared hZoomBar As HWND   ' barre de zoom horizontale en haut du graphique
 Dim Shared As Integer winW, winH
@@ -278,6 +325,23 @@ Declare Sub ForceRedraw(hWnd As HWND)
 Declare Sub LoadCSV(ByVal filename As String, hWnd As HWND)
 Declare Function File_GetName(ByVal hWndParent As HWND) As String
 Declare Function DistToSegment(px As Single, py As Single, x1 As Single, y1 As Single, x2 As Single, y2 As Single) As Single
+Declare Sub OpenDataSourceWindow(hWndParent As HWND)
+Declare Function DataSourceProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+Declare Sub OpenApiKeysWindow(hWndParent As HWND)
+Declare Function ApiKeysProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+Declare Sub LoadIniFile()
+Declare Sub SaveIniFile()
+Declare Sub TiingoGetChart(hWndParent As HWND)
+Declare Sub YahooFinanceGetChart(hWndParent As HWND)
+Declare Sub YahooFinanceParseAndLoad(ByVal jsonPath As String, hWnd As HWND)
+Declare Function YFNextToken(ByVal arr As String, ByRef scanPos As Integer) As String
+Declare Function UnixToCSVDate(ByVal ts As Double) As String
+Declare Sub TiingoCheckDone(hWnd As HWND)
+Declare Sub TiingoParseAndLoad(ByVal jsonPath As String, hWnd As HWND)
+Declare Function TiingoFreq(tfIdx As Integer) As String
+Declare Function TiingoTFMin(tfIdx As Integer) As Integer
+Declare Function ExtractJsonStr(ByVal obj As String, ByVal key As String) As String
+Declare Function ExtractJsonNum(ByVal obj As String, ByVal key As String) As String
 Declare Sub SnapToCandle(mx As Integer, my As Integer)
 Declare Function RSIPanelTop(rsiIdx As Integer, mainChartH As Integer) As Integer
 Declare Function HitTestCanvas(mx As Integer, my As Integer) As Integer
@@ -2189,8 +2253,11 @@ End Function
 Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
     Select Case uMsg
         Case WM_CREATE
+            hWndMain = hWnd   ' stocker pour SetTimer depuis DataSourceProc
+            LoadIniFile()     ' charger les clés API depuis QChartist2.ini
             Dim hM As HMENU = CreateMenu(), hF As HMENU = CreatePopupMenu()
-            AppendMenu(hF, MF_STRING, ID_MENU_OPEN, "&Open CSV")
+            AppendMenu(hF, MF_STRING, ID_MENU_OPEN,       "&Open CSV")
+            AppendMenu(hF, MF_STRING, ID_MENU_DATASOURCE, "&Data Source...")
             AppendMenu(hM, MF_POPUP, Cast(UINT_PTR, hF), "&File") : SetMenu(hWnd, hM)
             hToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, _
                 WS_CHILD Or WS_VISIBLE Or CCS_VERT Or CCS_NORESIZE Or TBSTYLE_FLAT Or TBSTYLE_WRAPABLE, _
@@ -2281,6 +2348,10 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
             Dim id As Integer = Loword(wParam)
             If id = ID_MENU_OPEN Then
                 Dim f As String = File_GetName(hWnd) : If f <> "" Then LoadCSV(f, hWnd)
+            ElseIf id = ID_MENU_DATASOURCE Then
+                OpenDataSourceWindow(hWnd)
+            ElseIf id = ID_DS_GETCHART Then
+                TiingoGetChart(hWnd)
             ElseIf id >= ID_TOOL_SELECT And id <= ID_TOOL_PARALINES Then
                 currentTool = id : isDrawing = 0 : circleClickNb = 0 : fiboFanClickNb = 0 : gannFanClickNb = 0 : fiboRetClickNb = 0 : gannGridClickNb = 0 : pentaClickNb = 0 : paraClickNb = 0
                 ' Réinitialiser le crosshair quand on change d'outil
@@ -2823,6 +2894,11 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
             If cp < 0 Then cp = 0 : If cp > ms Then cp = ms
             QChart.ViewStart = cp : SetScrollPos(hScroll, SB_CTL, cp, TRUE) : ForceRedraw(hWnd)
 
+        Case WM_TIMER
+            If wParam = ID_DS_TIMER And dsTimerActive = 1 Then
+                TiingoCheckDone(hWnd)
+            End If
+
         Case WM_SIZE
             winW = Loword(lParam) : winH = Hiword(lParam)
             ' Récupère la largeur réelle que la toolbar veut occuper
@@ -2856,6 +2932,667 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
         Case WM_DESTROY : PostQuitMessage(0) : Return 0
     End Select
     Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+End Function
+
+' ── Data Source (Tiingo) ──────────────────────────────────────────────────────
+
+Sub OpenDataSourceWindow(hWndParent As HWND)
+    If hDSWin <> 0 Then
+        ShowWindow(hDSWin, SW_RESTORE)
+        SetForegroundWindow(hDSWin)
+        Return
+    End If
+
+    ' Créer une fenêtre simple non-modale
+    Dim wcDS As WNDCLASS
+    wcDS.lpfnWndProc   = @DataSourceProc
+    wcDS.hInstance     = GetModuleHandle(NULL)
+    wcDS.hCursor       = LoadCursor(NULL, IDC_ARROW)
+    wcDS.hbrBackground = Cast(HBRUSH, COLOR_BTNFACE + 1)
+    wcDS.lpszClassName = StrPtr("DSWin")
+    RegisterClass(@wcDS)
+    hDSWin = CreateWindowEx(WS_EX_TOOLWINDOW, "DSWin", "Data Source", _
+        WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_VISIBLE, _
+        200, 150, 420, 290, hWndParent, NULL, GetModuleHandle(NULL), NULL)
+End Sub
+
+Function DataSourceProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+    Select Case uMsg
+        Case WM_CREATE
+            ' Source combobox
+            CreateWindowEx(0,"STATIC","Source:",WS_CHILD Or WS_VISIBLE,8,10,55,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hDSSource = CreateWindowEx(0,"COMBOBOX","",WS_CHILD Or WS_VISIBLE Or CBS_DROPDOWNLIST Or WS_VSCROLL,68,8,300,200,hWnd,Cast(HMENU,ID_DS_SOURCE),GetModuleHandle(NULL),NULL)
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Tiingo Cryptocurrencies")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Yahoo Finance")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Stooq")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Alpha Vantage Stocks")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Alpha Vantage Forex")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Alpha Vantage Crypto")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Tiingo IEX")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Finnhub Stocks")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Finnhub Crypto")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("Twelvedata")))
+            SendMessage(hDSSource, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("QChartist Exchange")))
+            SendMessage(hDSSource, CB_SETCURSEL, 0, 0)   ' défaut : Tiingo Cryptocurrencies
+            ' Symbol
+            CreateWindowEx(0,"STATIC","Symbol:",WS_CHILD Or WS_VISIBLE,8,34,55,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hDSSymbol = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","btcusdt",WS_CHILD Or WS_VISIBLE Or ES_UPPERCASE,68,32,120,20,hWnd,Cast(HMENU,ID_DS_SYMBOL),GetModuleHandle(NULL),NULL)
+            ' Start date
+            CreateWindowEx(0,"STATIC","Start date:",WS_CHILD Or WS_VISIBLE,8,58,60,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hDSStartDate = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","2025-01-01",WS_CHILD Or WS_VISIBLE,68,56,120,20,hWnd,Cast(HMENU,ID_DS_STARTDATE),GetModuleHandle(NULL),NULL)
+            ' End date
+            CreateWindowEx(0,"STATIC","End date:",WS_CHILD Or WS_VISIBLE,8,82,60,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hDSEndDate = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","2026-03-25",WS_CHILD Or WS_VISIBLE,68,80,120,20,hWnd,Cast(HMENU,ID_DS_ENDDATE),GetModuleHandle(NULL),NULL)
+            ' Timeframe combobox
+            CreateWindowEx(0,"STATIC","Timeframe:",WS_CHILD Or WS_VISIBLE,8,106,65,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hDSTF = CreateWindowEx(0,"COMBOBOX","",WS_CHILD Or WS_VISIBLE Or CBS_DROPDOWNLIST Or WS_VSCROLL,68,104,80,160,hWnd,Cast(HMENU,ID_DS_TF),GetModuleHandle(NULL),NULL)
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("1M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("5M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("15M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("30M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("60M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("240M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("1440M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("10080M")))
+            SendMessage(hDSTF, CB_ADDSTRING, 0, Cast(LPARAM, StrPtr("43200M")))
+            SendMessage(hDSTF, CB_SETCURSEL, 6, 0)   ' défaut 1440M
+            ' Boutons Get chart + API Keys
+            hDSGetChart = CreateWindowEx(0,"BUTTON","Get chart",WS_CHILD Or WS_VISIBLE Or BS_PUSHBUTTON,8,134,90,24,hWnd,Cast(HMENU,ID_DS_GETCHART),GetModuleHandle(NULL),NULL)
+            CreateWindowEx(0,"BUTTON","API keys",WS_CHILD Or WS_VISIBLE Or BS_PUSHBUTTON,108,134,80,24,hWnd,Cast(HMENU,ID_DS_APIKEYS_BTN),GetModuleHandle(NULL),NULL)
+            hDSStatus = CreateWindowEx(0,"STATIC","Ready",WS_CHILD Or WS_VISIBLE,8,168,370,36,hWnd,Cast(HMENU,ID_DS_STATUS),GetModuleHandle(NULL),NULL)
+
+        Case WM_COMMAND
+            Dim dsId As Integer = Loword(wParam)
+            If dsId = ID_DS_GETCHART Then
+                Dim srcIdx As Integer = 0
+                If hDSSource <> 0 Then srcIdx = SendMessage(hDSSource, CB_GETCURSEL, 0, 0)
+                Select Case srcIdx
+                    Case 0 : TiingoGetChart(hWndMain)         ' Tiingo Cryptocurrencies
+                    Case 1 : YahooFinanceGetChart(hWndMain)   ' Yahoo Finance
+                    Case Else
+                        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Source not yet implemented.")
+                End Select
+            ElseIf dsId = ID_DS_APIKEYS_BTN Then
+                OpenApiKeysWindow(hWnd)
+            End If
+
+        Case WM_DESTROY
+            hDSWin = 0
+            Return 0
+    End Select
+    Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+End Function
+
+' ── Retourne la chaîne de fréquence Tiingo selon l'index combobox ─────────────
+Function TiingoFreq(tfIdx As Integer) As String
+    Select Case tfIdx
+        Case 0 : Return "1min"
+        Case 1 : Return "5min"
+        Case 2 : Return "15min"
+        Case 3 : Return "30min"
+        Case 4 : Return "60min"
+        Case 5 : Return "240min"
+        Case 6 : Return "1440min"
+        Case 7 : Return "10080min"
+        Case 8 : Return "43200min"
+    End Select
+    Return "60min"
+End Function
+
+Function TiingoTFMin(tfIdx As Integer) As Integer
+    Dim mins(8) As Integer = {1,5,15,30,60,240,1440,10080,43200}
+    If tfIdx >= 0 And tfIdx <= 8 Then Return mins(tfIdx)
+    Return 60
+End Function
+
+Sub TiingoGetChart(hWndParent As HWND)
+    If hDSWin = 0 Then Return
+    If gKeyTiingo = "" Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Please enter your Tiingo API key (API keys button).")
+        Return
+    End If
+
+    ' Lire les champs
+    Dim zSym   As ZString * 64  : GetWindowText(hDSSymbol,    @zSym,    64)
+    Dim zStart As ZString * 32  : GetWindowText(hDSStartDate, @zStart,  32)
+    Dim tfIdx As Integer = SendMessage(hDSTF, CB_GETCURSEL, 0, 0)
+
+    Dim sym   As String = Trim(zSym)
+    Dim sdate As String = Trim(zStart)
+    Dim key   As String = Trim(gKeyTiingo)   ' clé Tiingo depuis la fenêtre API Keys
+    Dim freq  As String = TiingoFreq(tfIdx)
+    Dim tfMin As Integer = TiingoTFMin(tfIdx)
+
+    If sym = "" Or key = "" Then
+        SetWindowText(hDSStatus, "Please enter a symbol and API key.")
+        Return
+    End If
+
+    ' Préparer le dossier tiingo
+    Dim zTiingoDir As ZString * 32 = "tiingo"
+    CreateDirectory(@zTiingoDir, NULL)
+
+    dsBusyFile   = "tiingo\isbusy.txt"
+    dsPendingCSV = "tiingo\" & UCase(sym) & Str(tfMin) & ".csv"
+    dsActiveSource = 0
+
+    ' Supprimer t1.txt s'il existe (évite faux positif du timer)
+    Dim t1Old As String = "tiingo\t1.txt"
+    If FileLen(t1Old) > 0 Then Kill t1Old
+
+    ' Écrire isbusy = 1
+    Dim fb As Integer = FreeFile
+    Open dsBusyFile For Output As #fb : Print #fb, "1" : Close #fb
+
+    ' Écrire un .bat temporaire dans tiingo\ pour éviter les pb de guillemets
+    ' Le bat fait : curl ... && echo 0 > isbusy.txt
+    Dim batPath As String = "tiingo\_fetch.bat"
+    Dim fw As Integer = FreeFile
+    Open batPath For Output As #fw
+    Print #fw, "@echo off"
+    ' Essayer curl d'abord (dossier local puis PATH), sinon PowerShell (Windows 7+)
+    Print #fw, "if exist curl.exe set CURL=curl.exe"
+    Print #fw, "if not exist curl.exe set CURL=curl"
+    Print #fw, "%CURL% --version >nul 2>&1"
+    Print #fw, "if %errorlevel% equ 0 goto USE_CURL"
+    Print #fw, ":USE_POWERSHELL"
+    ' PowerShell fallback pour Windows 7 sans curl
+    Dim psUrl As String = "https://api.tiingo.com/tiingo/crypto/prices?tickers=" & _
+        UCase(sym) & "&startDate=" & sdate & "&resampleFreq=" & freq & "&token=" & key
+    Print #fw, "powershell -Command ""(New-Object Net.WebClient).DownloadFile('" & _
+        psUrl & "', 't1.txt')"""
+    Print #fw, "goto DONE"
+    Print #fw, ":USE_CURL"
+    ' curl avec token dans header Authorization (méthode recommandée Tiingo)
+    Print #fw, "%CURL% --connect-timeout 30 -m 120 -k " & _
+        "-H " & Chr(34) & "Authorization: Token " & key & Chr(34) & _
+        " -o t1.txt " & _
+        Chr(34) & "https://api.tiingo.com/tiingo/crypto/prices?tickers=" & _
+        UCase(sym) & "&startDate=" & sdate & "&resampleFreq=" & freq & Chr(34)
+    Print #fw, ":DONE"
+    Print #fw, "echo 0 > isbusy.txt"
+    Close #fw
+
+    ' Lancer via cmd.exe /c
+    Dim zCmd  As ZString * 16  = "cmd.exe"
+    Dim zArgs As ZString * 128
+    zArgs = "/c _fetch.bat"
+    Dim zDir  As ZString * 64  = "tiingo"
+    Dim zVerb As ZString * 8   = "open"
+    ShellExecute(hWndParent, @zVerb, @zCmd, @zArgs, @zDir, 0)
+
+    SetWindowText(hDSStatus, "Downloading " & UCase(sym) & " " & freq & "...")
+
+    ' Démarrer le timer de polling (vérifie isbusy.txt toutes les 1s)
+    dsTimerActive = 1
+    dsTimerCount  = 0
+    SetTimer(hWndParent, ID_DS_TIMER, 1000, NULL)
+End Sub
+
+Sub TiingoCheckDone(hWnd As HWND)
+    dsTimerCount += 1
+    ' Le fichier à surveiller dépend de la source active
+    Dim t1Path As String
+    Select Case dsActiveSource
+        Case 0  : t1Path = "tiingo\t1.txt"
+        Case 1  : t1Path = "yahoo\yf1.txt"
+        Case Else : t1Path = "tiingo\t1.txt"
+    End Select
+    Dim fi As Integer = FreeFile
+    Dim fsize As Long = 0
+    If Open(t1Path For Input As #fi) = 0 Then
+        fsize = LOF(fi)
+        Close #fi
+    End If
+
+    If fsize > 100 Then
+        KillTimer(hWnd, ID_DS_TIMER)
+        dsTimerActive = 0
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Parsing and loading...")
+        Select Case dsActiveSource
+            Case 0 : TiingoParseAndLoad(t1Path, hWnd)
+            Case 1 : YahooFinanceParseAndLoad(t1Path, hWnd)
+            Case Else : TiingoParseAndLoad(t1Path, hWnd)
+        End Select
+    ElseIf dsTimerCount > 120 Then
+        ' Timeout après 120 secondes
+        KillTimer(hWnd, ID_DS_TIMER)
+        dsTimerActive = 0
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Error: timeout - check API key and connection.")
+    Else
+        ' Afficher progression (dots animés)
+        Dim dots As String = String(dsTimerCount Mod 4, ".")
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Downloading" & dots & " (" & Str(dsTimerCount) & "s)")
+    End If
+End Sub
+
+' ── Parser JSON Tiingo et écriture CSV ───────────────────────────────────────
+' Format Tiingo : [{"ticker":"...","priceData":[{"date":"2026-03-09T16:00:00+00:00",
+'   "open":...,"high":...,"low":...,"close":...,"volume":...},...]}]
+Sub TiingoParseAndLoad(ByVal jsonPath As String, hWnd As HWND)
+    ' Lire tout le JSON en mémoire
+    Dim fi As Integer = FreeFile
+    If Open(jsonPath For Input As #fi) <> 0 Then Return
+    Dim json As String = ""
+    Dim ln  As String
+    Do While Not EOF(fi)
+        Line Input #fi, ln
+        json &= ln
+    Loop
+    Close #fi
+
+    ' Trouver priceData array
+    Dim pdStart As Long = InStr(json, """priceData"":[")
+    If pdStart = 0 Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Error: no priceData in response.")
+        Return
+    End If
+    pdStart += Len("""priceData"":[")
+    Dim pdEnd As Long = InStr(pdStart, json, "]}")
+    If pdEnd = 0 Then pdEnd = Len(json)
+
+    Dim priceSection As String = Mid(json, pdStart, pdEnd - pdStart)
+
+    ' Parser chaque objet { ... }
+    Dim tfIdx As Integer = 0
+    If hDSTF <> 0 Then tfIdx = SendMessage(hDSTF, CB_GETCURSEL, 0, 0)
+    Dim tfMin As Integer = TiingoTFMin(tfIdx)
+
+    ' Écrire directement dans le CSV pendant le parsing
+    Dim fo As Integer = FreeFile
+    If Open(dsPendingCSV For Output As #fo) <> 0 Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Error: cannot write CSV.")
+        Return
+    End If
+
+    Dim barCount As Integer = 0
+    Dim parsePos As Long = 1
+
+    Do
+        Dim objStart As Integer = InStr(parsePos, priceSection, "{")
+        If objStart = 0 Then Exit Do
+        Dim objEnd As Integer = InStr(objStart, priceSection, "}")
+        If objEnd = 0 Then Exit Do
+        Dim obj As String = Mid(priceSection, objStart, objEnd - objStart + 1)
+        parsePos = objEnd + 1
+
+        ' Extraire date
+        Dim dateStr As String = ExtractJsonStr(obj, "date")
+        ' Format: 2026-03-09T16:00:00+00:00
+        Dim dtDate As String = Left(dateStr, 10)   ' YYYY-MM-DD
+        Dim dtTime As String = Mid(dateStr, 12, 5)  ' HH:MM
+
+        Dim openV  As String = ExtractJsonNum(obj, "open")
+        Dim highV  As String = ExtractJsonNum(obj, "high")
+        Dim lowV   As String = ExtractJsonNum(obj, "low")
+        Dim closeV As String = ExtractJsonNum(obj, "close")
+        Dim volV   As String = ExtractJsonNum(obj, "volume")
+
+        If dtDate <> "" And openV <> "" Then
+            Print #fo, dtDate & "," & dtTime & "," & openV & "," & highV & "," & lowV & "," & closeV & "," & volV
+            barCount += 1
+        End If
+    Loop
+
+    Close #fo
+
+    If barCount = 0 Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Error: no bars parsed.")
+        Return
+    End If
+    LoadCSV(dsPendingCSV, hWnd)
+
+    Dim zSym As ZString * 64
+    If hDSSymbol <> 0 Then GetWindowText(hDSSymbol, @zSym, 64)
+    Dim statusMsg As String = "Loaded " & Str(barCount) & " bars for " & Trim(zSym)
+    If hDSStatus <> 0 Then SetWindowText(hDSStatus, statusMsg)
+End Sub
+
+' ── Helpers extraction JSON minimaliste ──────────────────────────────────────
+Function ExtractJsonStr(ByVal obj As String, ByVal key As String) As String
+    Dim srchKey As String = Chr(34) & key & Chr(34) & ":"
+    Dim p As Integer = InStr(obj, srchKey)
+    If p = 0 Then Return ""
+    p += Len(srchKey)
+    ' Sauter espaces
+    Do While p <= Len(obj) And Mid(obj, p, 1) = " " : p += 1 : Loop
+    If Mid(obj, p, 1) = Chr(34) Then
+        p += 1
+        Dim q As Integer = InStr(p, obj, Chr(34))
+        If q = 0 Then Return ""
+        Return Mid(obj, p, q - p)
+    End If
+    Return ""
+End Function
+
+Function ExtractJsonNum(ByVal obj As String, ByVal key As String) As String
+    Dim srchKey As String = Chr(34) & key & Chr(34) & ":"
+    Dim p As Integer = InStr(obj, srchKey)
+    If p = 0 Then Return ""
+    p += Len(srchKey)
+    Do While p <= Len(obj) And Mid(obj, p, 1) = " " : p += 1 : Loop
+    Dim result As String = ""
+    Do While p <= Len(obj)
+        Dim c As String = Mid(obj, p, 1)
+        If c >= "0" And c <= "9" Or c = "." Or c = "-" Or c = "e" Or c = "E" Or c = "+" Then
+            result &= c : p += 1
+        Else
+            Exit Do
+        End If
+    Loop
+    Return result
+End Function
+
+' ── API Keys window ───────────────────────────────────────────────────────────
+Sub OpenApiKeysWindow(hWndParent As HWND)
+    If hAKWin <> 0 Then
+        ShowWindow(hAKWin, SW_RESTORE)
+        SetForegroundWindow(hAKWin)
+        Return
+    End If
+    Dim wcAK As WNDCLASS
+    wcAK.lpfnWndProc   = @ApiKeysProc
+    wcAK.hInstance     = GetModuleHandle(NULL)
+    wcAK.hCursor       = LoadCursor(NULL, IDC_ARROW)
+    wcAK.hbrBackground = Cast(HBRUSH, COLOR_BTNFACE + 1)
+    wcAK.lpszClassName = StrPtr("AKWin")
+    RegisterClass(@wcAK)
+    hAKWin = CreateWindowEx(WS_EX_TOOLWINDOW, "AKWin", "API Keys", _
+        WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_VISIBLE, _
+        250, 180, 400, 230, hWndParent, NULL, GetModuleHandle(NULL), NULL)
+End Sub
+
+Function ApiKeysProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+    Dim lw As Integer = 180   ' largeur label
+    Dim fw As Integer = 180   ' largeur champ edit
+    Dim ex As Integer = 8     ' x départ label
+    Dim fx As Integer = 190   ' x départ edit
+    Select Case uMsg
+        Case WM_CREATE
+            CreateWindowEx(0,"STATIC","Enter your Tiingo API key:",    WS_CHILD Or WS_VISIBLE, ex,12, lw,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hAKTiingo  = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","",WS_CHILD Or WS_VISIBLE Or ES_AUTOHSCROLL, fx,10, fw,20,hWnd,Cast(HMENU,ID_AK_TIINGO),   GetModuleHandle(NULL),NULL)
+            CreateWindowEx(0,"STATIC","Enter your Finnhub API key:",   WS_CHILD Or WS_VISIBLE, ex,42, lw,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hAKFinnhub = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","",WS_CHILD Or WS_VISIBLE Or ES_AUTOHSCROLL, fx,40, fw,20,hWnd,Cast(HMENU,ID_AK_FINNHUB),   GetModuleHandle(NULL),NULL)
+            CreateWindowEx(0,"STATIC","Enter your Alpha Vantage API key:", WS_CHILD Or WS_VISIBLE, ex,72, lw,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hAKAlpha   = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","",WS_CHILD Or WS_VISIBLE Or ES_AUTOHSCROLL, fx,70, fw,20,hWnd,Cast(HMENU,ID_AK_ALPHAVANTAGE),GetModuleHandle(NULL),NULL)
+            CreateWindowEx(0,"STATIC","Enter your Twelvedata API key:", WS_CHILD Or WS_VISIBLE, ex,102,lw,18,hWnd,NULL,GetModuleHandle(NULL),NULL)
+            hAKTwelve  = CreateWindowEx(WS_EX_CLIENTEDGE,"EDIT","",WS_CHILD Or WS_VISIBLE Or ES_AUTOHSCROLL, fx,100,fw,20,hWnd,Cast(HMENU,ID_AK_TWELVEDATA), GetModuleHandle(NULL),NULL)
+            ' Bouton Save
+            CreateWindowEx(0,"BUTTON","Save",WS_CHILD Or WS_VISIBLE Or BS_PUSHBUTTON, 160,140,70,24,hWnd,Cast(HMENU,ID_AK_SAVE),GetModuleHandle(NULL),NULL)
+            ' Pré-remplir depuis les variables globales
+            If gKeyTiingo    <> "" Then SetWindowText(hAKTiingo,  gKeyTiingo)
+            If gKeyFinnhub   <> "" Then SetWindowText(hAKFinnhub, gKeyFinnhub)
+            If gKeyAlpha     <> "" Then SetWindowText(hAKAlpha,   gKeyAlpha)
+            If gKeyTwelvedata <> "" Then SetWindowText(hAKTwelve, gKeyTwelvedata)
+
+        Case WM_COMMAND
+            If Loword(wParam) = ID_AK_SAVE Then
+                ' Lire les champs
+                Dim z1 As ZString*512 : GetWindowText(hAKTiingo,  @z1, 512) : gKeyTiingo     = Trim(z1)
+                Dim z2 As ZString*512 : GetWindowText(hAKFinnhub, @z2, 512) : gKeyFinnhub    = Trim(z2)
+                Dim z3 As ZString*512 : GetWindowText(hAKAlpha,   @z3, 512) : gKeyAlpha      = Trim(z3)
+                Dim z4 As ZString*512 : GetWindowText(hAKTwelve,  @z4, 512) : gKeyTwelvedata = Trim(z4)
+                SaveIniFile()
+                DestroyWindow(hWnd)
+            End If
+
+        Case WM_DESTROY
+            ' Sauvegarder aussi à la fermeture (croix)
+            If hAKTiingo <> 0 Then
+                Dim z1c As ZString*512 : GetWindowText(hAKTiingo,  @z1c, 512) : gKeyTiingo     = Trim(z1c)
+                Dim z2c As ZString*512 : GetWindowText(hAKFinnhub, @z2c, 512) : gKeyFinnhub    = Trim(z2c)
+                Dim z3c As ZString*512 : GetWindowText(hAKAlpha,   @z3c, 512) : gKeyAlpha      = Trim(z3c)
+                Dim z4c As ZString*512 : GetWindowText(hAKTwelve,  @z4c, 512) : gKeyTwelvedata = Trim(z4c)
+                SaveIniFile()
+            End If
+            hAKWin = 0
+            Return 0
+    End Select
+    Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+End Function
+
+' ── Lecture/écriture QChartist2.ini ──────────────────────────────────────────
+Sub LoadIniFile()
+    Dim fi As Integer = FreeFile
+    If Open("QChartist2.ini" For Input As #fi) <> 0 Then Return
+    Dim ln As String
+    Do While Not EOF(fi)
+        Line Input #fi, ln
+        ln = Trim(ln)
+        Dim eq As Integer = InStr(ln, "=")
+        If eq = 0 Then Continue Do
+        Dim k As String = Trim(Left(ln, eq - 1))
+        Dim v As String = Trim(Mid(ln, eq + 1))
+        Select Case LCase(k)
+            Case "tiingo_apikey"    : gKeyTiingo     = v
+            Case "finnhub_apikey"   : gKeyFinnhub    = v
+            Case "alpha_apikey"     : gKeyAlpha      = v
+            Case "twelvedata_apikey": gKeyTwelvedata = v
+        End Select
+    Loop
+    Close #fi
+End Sub
+
+Sub SaveIniFile()
+    Dim fo As Integer = FreeFile
+    If Open("QChartist2.ini" For Output As #fo) <> 0 Then Return
+    Print #fo, "tiingo_apikey="     & gKeyTiingo
+    Print #fo, "finnhub_apikey="    & gKeyFinnhub
+    Print #fo, "alpha_apikey="      & gKeyAlpha
+    Print #fo, "twelvedata_apikey=" & gKeyTwelvedata
+    Close #fo
+End Sub
+
+' ── Yahoo Finance ─────────────────────────────────────────────────────────────
+Sub YahooFinanceGetChart(hWndParent As HWND)
+    If hDSWin = 0 Then Return
+
+    Dim zSym   As ZString * 64  : GetWindowText(hDSSymbol,    @zSym,   64)
+    Dim zStart As ZString * 32  : GetWindowText(hDSStartDate, @zStart, 32)
+    Dim zEnd   As ZString * 32  : GetWindowText(hDSEndDate,   @zEnd,   32)
+    Dim tfIdx  As Integer = SendMessage(hDSTF, CB_GETCURSEL, 0, 0)
+
+    Dim sym    As String = UCase(Trim(zSym))
+    Dim tfMin  As Integer = TiingoTFMin(tfIdx)
+
+    If sym = "" Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Please enter a symbol.")
+        Return
+    End If
+
+    ' Convertir les dates en Unix timestamps
+    ' Format attendu : YYYY-MM-DD
+    Dim sdate As String = Trim(zStart)
+    Dim edate As String = Trim(zEnd)
+
+    Dim syr As Integer = CInt(Mid(sdate,1,4))
+    Dim smo As Integer = CInt(Mid(sdate,6,2))
+    Dim sdy As Integer = CInt(Mid(sdate,9,2))
+    Dim eyr As Integer = CInt(Mid(edate,1,4))
+    Dim emo As Integer = CInt(Mid(edate,6,2))
+    Dim edy As Integer = CInt(Mid(edate,9,2))
+
+    Dim tsStart As Long = CLng((CDbl(DateSerial(syr,smo,sdy)) - 25569.0) * 86400.0)
+    Dim tsEnd   As Long = CLng((CDbl(DateSerial(eyr,emo,edy)) - 25569.0) * 86400.0) + 86400
+
+    ' Intervalle YF
+    Dim yfInterval As String
+    Select Case tfMin
+        Case 1    : yfInterval = "1m"
+        Case 5    : yfInterval = "5m"
+        Case 15   : yfInterval = "15m"
+        Case 30   : yfInterval = "30m"
+        Case 60   : yfInterval = "1h"
+        Case 240  : yfInterval = "1h"   ' YF n'a pas de 4h natif
+        Case 1440 : yfInterval = "1d"
+        Case 10080: yfInterval = "1wk"
+        Case 43200: yfInterval = "1mo"
+        Case Else : yfInterval = "1d"
+    End Select
+
+    ' Préparer dossier
+    Dim zYFDir As ZString * 32 = "yahoo"
+    CreateDirectory(@zYFDir, NULL)
+
+    dsBusyFile   = "yahoo\isbusy.txt"
+    dsPendingCSV = "yahoo\" & sym & Str(tfMin) & ".csv"
+    dsActiveSource = 1
+
+    ' Supprimer yf1.txt pour éviter faux positif
+    Dim yfJson As String = "yahoo\yf1.txt"
+    If FileLen(yfJson) > 0 Then Kill yfJson
+
+    ' Générer le .bat
+    Dim batPath As String = "yahoo\_fetch.bat"
+    Dim fw As Integer = FreeFile
+    Open batPath For Output As #fw
+    Print #fw, "@echo off"
+    Print #fw, "if exist curl.exe (set CURL=curl.exe) else (set CURL=curl)"
+    ' User-Agent Mozilla pour éviter le blocage YF
+    Dim yfUrl As String = "https://query1.finance.yahoo.com/v8/finance/chart/" & sym & _
+        "?interval=" & yfInterval & "&period1=" & Str(tsStart) & "&period2=" & Str(tsEnd)
+    Print #fw, "%CURL% -A " & Chr(34) & "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" & Chr(34) & _
+        " --connect-timeout 30 -m 60 -k -o yf1.txt " & Chr(34) & yfUrl & Chr(34)
+    Print #fw, "echo 0 > isbusy.txt"
+    Close #fw
+
+    Dim zCmd  As ZString * 16  = "cmd.exe"
+    Dim zArgs As ZString * 128 : zArgs = "/c _fetch.bat"
+    Dim zDir  As ZString * 64  = "yahoo"
+    Dim zVerb As ZString * 8   = "open"
+    ShellExecute(hWndParent, @zVerb, @zCmd, @zArgs, @zDir, 0)
+
+    ' Rediriger le timer vers yahoo\yf1.txt
+    dsBusyFile = "yahoo\yf1.txt"  ' CheckDone regarde ce fichier
+    SetWindowText(hDSStatus, "Downloading " & sym & " from Yahoo Finance...")
+
+    dsTimerActive = 1
+    dsTimerCount  = 0
+    SetTimer(hWndParent, ID_DS_TIMER, 1000, NULL)
+End Sub
+
+' ── Parser JSON Yahoo Finance ─────────────────────────────────────────────────
+' Format : {"chart":{"result":[{"timestamp":[...],"indicators":{"quote":[{
+'   "open":[...],"high":[...],"low":[...],"close":[...],"volume":[...]}]}}]}}
+Sub YahooFinanceParseAndLoad(ByVal jsonPath As String, hWnd As HWND)
+    ' Parser via yf_parse.py (Python embarqué) — évite tout problème InStr/Long/Integer
+    ' Le script Python utilise json.load() natif → parsing correct garanti
+
+    ' Chercher python dans : dossier local embarqué, puis PATH
+    Dim pyExe As String
+    If FileLen("python-3.13.12-embed-amd64\python.exe") > 0 Then
+        pyExe = "python-3.13.12-embed-amd64\python.exe"
+    Else
+        pyExe = "python"
+    End If
+
+    ' Copier yf_parse.py dans le dossier yahoo si besoin
+    If FileLen("yahoo\yf_parse.py") <= 0 Then
+        If FileLen("yf_parse.py") > 0 Then
+            FileCopy "yf_parse.py", "yahoo\yf_parse.py"
+        End If
+    End If
+
+    ' Générer le bat qui lance le parser
+    Dim batPath As String = "yahoo\_parse.bat"
+    Dim fw As Integer = FreeFile
+    Open batPath For Output As #fw
+    Print #fw, "@echo off"
+    ' Chemin absolu vers python et le script
+    Dim absPy  As String = CurDir & "\" & pyExe
+    Dim absSc  As String = CurDir & "\yahoo\yf_parse.py"
+    Dim absIn  As String = CurDir & "\yahoo\yf1.txt"
+    Dim absOut As String = CurDir & "\" & dsPendingCSV
+    Print #fw, Chr(34) & absPy & Chr(34) & " " & Chr(34) & absSc & Chr(34) & _
+        " " & Chr(34) & absIn & Chr(34) & " " & Chr(34) & absOut & Chr(34)
+    Print #fw, "echo 0 > isbusy.txt"
+    Close #fw
+
+    ' Supprimer le CSV destination pour détecter la fin
+    If FileLen(dsPendingCSV) > 0 Then Kill dsPendingCSV
+
+    ' Lancer le bat
+    Dim zCmd  As ZString * 16 = "cmd.exe"
+    Dim zArgs As ZString * 32 : zArgs = "/c _parse.bat"
+    Dim zDir  As ZString * 64 = "yahoo"
+    Dim zVerb As ZString * 8  = "open"
+    ShellExecute(hWnd, @zVerb, @zCmd, @zArgs, @zDir, 0)
+
+    ' Attendre que le CSV soit créé (max 15s, check toutes les 500ms)
+    Dim waited As Integer = 0
+    Do
+        Sleep 500
+        waited += 1
+        If FileLen(dsPendingCSV) > 10 Then Exit Do
+    Loop Until waited > 30
+
+    If FileLen(dsPendingCSV) < 10 Then
+        If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Error: Python parser failed. Check yf_parse.py is present.")
+        Return
+    End If
+
+    LoadCSV(dsPendingCSV, hWnd)
+    Dim zSym2 As ZString * 64
+    If hDSSymbol <> 0 Then GetWindowText(hDSSymbol, @zSym2, 64)
+    ' Compter les barres
+    Dim fc As Integer = FreeFile, barCount As Integer = 0
+    If Open(dsPendingCSV For Input As #fc) = 0 Then
+        Dim tmp As String
+        Do While Not EOF(fc) : Line Input #fc, tmp : barCount += 1 : Loop
+        Close #fc
+    End If
+    If hDSStatus <> 0 Then SetWindowText(hDSStatus, "Loaded " & Str(barCount) & " bars from Yahoo Finance.")
+End Sub
+
+' ── Extraire le prochain token d'un tableau CSV ───────────────────────────────
+Function YFNextToken(ByVal arr As String, ByRef scanPos As Integer) As String
+    If scanPos > Len(arr) Then Return ""
+    ' Sauter espaces/virgules
+    Do While scanPos <= Len(arr)
+        Dim sc As String = Mid(arr, scanPos, 1)
+        If sc <> "," And sc <> " " Then Exit Do
+        scanPos += 1
+    Loop
+    If scanPos > Len(arr) Then Return ""
+    Dim result As String = ""
+    Do While scanPos <= Len(arr)
+        Dim c As String = Mid(arr, scanPos, 1)
+        If c = "," Then Exit Do
+        result &= c
+        scanPos += 1
+    Loop
+    Return Trim(result)
+End Function
+
+' ── Unix timestamp → "YYYY-MM-DD,HH:MM" ──────────────────────────────────────
+Function UnixToCSVDate(ByVal ts As Double) As String
+    ' Calcul direct depuis timestamp Unix sans CDate
+    Dim totalSec As Long = CLng(ts)
+    Dim hr As Integer    = (totalSec Mod 86400) \ 3600
+    Dim mn As Integer    = (totalSec Mod 3600)  \ 60
+
+    ' Jours depuis l'epoch Unix (01/01/1970) = jour julien modifié
+    Dim days As Long = totalSec \ 86400
+
+    ' Algorithme de conversion jours Unix → YYYY-MM-DD
+    Dim z As Long = days + 719468
+    Dim era As Long = IIf(z >= 0, z, z - 146096) \ 146097
+    Dim doe As Long = z - era * 146097
+    Dim yoe As Long = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+    Dim yr  As Integer = CInt(yoe + era * 400)
+    Dim doy As Long = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+    Dim mp  As Long = (5 * doy + 2) \ 153
+    Dim dy  As Integer = CInt(doy - (153 * mp + 2) \ 5 + 1)
+    Dim mo  As Integer = CInt(IIf(mp < 10, mp + 3, mp - 9))
+    If mo <= 2 Then yr += 1
+
+    Dim yrS As String = Right("0000" & Str(yr), 4)
+    Dim moS As String = Right("00"   & Str(mo), 2)
+    Dim dyS As String = Right("00"   & Str(dy), 2)
+    Dim hrS As String = Right("00"   & Str(hr), 2)
+    Dim mnS As String = Right("00"   & Str(mn), 2)
+
+    Return yrS & "-" & moS & "-" & dyS & "," & hrS & ":" & mnS
 End Function
 
 ' --- Main ---
