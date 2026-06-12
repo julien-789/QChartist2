@@ -53,6 +53,8 @@ Const SCROLL_H = 40
 #define ID_BTN_ZOOM_IN    3020
 #define ID_BTN_ZOOM_OUT   3021
 #define ID_POPUP_PARAMS   3030   ' menu item "Paramètres" du popup clic droit overlay
+#define ID_CHART_LOADCSV    5010   ' menu contextuel graphe : charger CSV
+#define ID_CHART_TECHNICALS 5011   ' menu contextuel graphe : indicateurs techniques
 
 Const ZOOM_BAR_H    = 28   ' hauteur de la barre de zoom
 Const ZOOM_MIN_BARS = 10   ' nombre minimum de bougies visibles
@@ -238,6 +240,93 @@ End Type
 Dim Shared ActivePanels(Any) As ActivePanel
 Dim Shared ActiveCount As Integer = 0
 
+' ── Multi-graphe ─────────────────────────────────────────────────────────────
+Const MAX_CHARTS = 4
+
+' Données propres à chaque fenêtre graphe enfant
+' Chaque graphe a son propre ViewStart/ViewCount et ses propres objets dessinés.
+' La source de données (QChart global) est partagée dans cette première version ;
+' les ActivePanels et drawables sont par-graphe.
+Type ChartWinData
+    hwnd        As HWND
+    chartIdx    As Integer      ' 0-based index dans hCharts()
+
+    ' Source de données propre à ce graphe
+    Chart       As QChartType   ' données OHLCV + ViewStart/ViewCount/IsLoaded/TimeFrame
+
+    ' Objets dessinés propres à ce graphe
+    Lines(Any)       As TrendLine
+    Circles(Any)     As Circle3P
+    FiboFans(Any)    As FiboFan
+    GannFans(Any)    As GannFan
+    FiboRets(Any)    As FiboRet
+    GannGrids(Any)   As GannGrid
+    Pentagrams(Any)  As Pentagram
+    ParaLinesArr(Any) As ParaLines
+
+    ' Indicateurs actifs
+    ActivePanels(Any) As ActivePanel
+    ActiveCount      As Integer
+
+    ' État outils
+    currentTool      As Integer
+    isDrawing        As Integer
+    crosshairX       As Integer
+    crosshairY       As Integer
+    tmpBar           As Integer
+    tmpPrice         As Double
+    tmpCanvasType    As Integer
+    circleClickNb    As Integer
+    circleBar(1 To 3) As Integer
+    circlePrice(1 To 3) As Double
+    fiboFanClickNb   As Integer
+    fiboFanBar1      As Integer
+    fiboFanPrice1    As Double
+    gannFanClickNb   As Integer
+    gannFanBar1      As Integer
+    gannFanPrice1    As Double
+    fiboRetClickNb   As Integer
+    fiboRetBar1      As Integer
+    fiboRetPrice1    As Double
+    gannGridClickNb  As Integer
+    gannGridBar1     As Integer
+    gannGridPrice1   As Double
+    pentaClickNb     As Integer
+    pentaBar1        As Integer
+    pentaPrice1      As Double
+    paraClickNb      As Integer
+    paraBar1         As Integer
+    paraPrice1       As Double
+    paraBar2         As Integer
+    paraPrice2       As Double
+    rightClickedOverlayIdx As Integer
+
+    ' Cache rendu (rempli par RenderChartGDIPlus, utilisé par hit-test)
+    vMin            As Double
+    vMax            As Double
+    scaleY          As Double
+    oriX            As Single
+    oriY            As Single
+    stepX           As Single
+    lenY            As Single
+    snapX           As Single
+    snapY           As Single
+    snapPrice       As Double
+    snapBar         As Integer
+    mainChartH_cached As Integer
+    PanelGeoms(MAX_INDICATORS - 1) As PanelGeom
+    PanelGeomCount  As Integer
+End Type
+
+' Handles des fenêtres enfant graphe
+Dim Shared hCharts(MAX_CHARTS - 1) As HWND
+Dim Shared chartCount As Integer = 0     ' nombre de graphes actifs (1, 2 ou 4)
+Dim Shared activeChartIdx As Integer = 0 ' index du graphe qui a le focus
+
+#define ID_MENU_VIEW1   5001
+#define ID_MENU_VIEW2   5002
+#define ID_MENU_VIEW4   5004
+
 ' --- Globales ---
 Dim Shared QChart     As QChartType   ' TF courant (fichier chargé)
 Dim Shared QChart1    As QChartType   ' 1 min
@@ -318,9 +407,14 @@ Dim Shared As Integer g_snapBar
 
 ' --- Prototypes ---
 Declare Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+Declare Function ChartWndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+Declare Sub ArrangeChartWindows(hParent As HWND)
+Declare Sub SetChartCount(hParent As HWND, n As Integer)
+Declare Function GetChartData(hWnd As HWND) As ChartWinData Ptr
+Declare Sub OpenTechnicalsForChart(hParent As HWND, chartIdx As Integer)
 Declare Function IndicatorsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
 Declare Function ParamsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
-Declare Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
+Declare Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer, pCD As ChartWinData Ptr)
 Declare Sub ForceRedraw(hWnd As HWND)
 Declare Sub LoadCSV(ByVal filename As String, hWnd As HWND)
 Declare Function File_GetName(ByVal hWndParent As HWND) As String
@@ -808,7 +902,9 @@ Function RSIPanelTop(rsiIdx As Integer, mainChartH As Integer) As Integer
     Return mainChartH + RSI_PANEL_MARGIN + rsiIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
 End Function
 
-Sub LoadCSV(ByVal filename As String, hWnd As HWND)
+' ── Charge un CSV dans un graphe spécifique (ChartWinData Ptr) ───────────────
+Sub LoadCSVToChart(ByVal filename As String, pCD As ChartWinData Ptr, hWndParent As HWND)
+    If pCD = NULL Then Exit Sub
     Dim As Integer f = FreeFile, count = 0
     Dim As String lineStr
     If Open(filename For Input As #f) <> 0 Then Exit Sub
@@ -818,26 +914,80 @@ Sub LoadCSV(ByVal filename As String, hWnd As HWND)
     Loop
     Close #f
     If count = 0 Then Exit Sub
-    ReDim QChart.History(count - 1)
+    ReDim pCD->Chart.History(count - 1)
     Open filename For Input As #f
     For i As Integer = 0 To count - 1
-        Input #f, QChart.History(i).Dt, QChart.History(i).Tm, QChart.History(i).O, QChart.History(i).H, QChart.History(i).L, QChart.History(i).C, QChart.History(i).V
-        ' Calculer le timestamp Unix pour chaque barre (nécessaire pour IBarShift)
-        QChart.History(i).Unix = DateToUnix(QChart.History(i).Dt, QChart.History(i).Tm)
+        Input #f, pCD->Chart.History(i).Dt, pCD->Chart.History(i).Tm, _
+                  pCD->Chart.History(i).O,  pCD->Chart.History(i).H, _
+                  pCD->Chart.History(i).L,  pCD->Chart.History(i).C, _
+                  pCD->Chart.History(i).V
+        pCD->Chart.History(i).Unix = DateToUnix(pCD->Chart.History(i).Dt, pCD->Chart.History(i).Tm)
     Next
     Close #f
-    QChart.IsLoaded = 1
-    Dim As Integer maxStart = count - QChart.ViewCount
+    pCD->Chart.IsLoaded  = 1
+    pCD->Chart.ViewCount = 60
+    Dim As Integer maxStart = count - pCD->Chart.ViewCount
     If maxStart < 0 Then maxStart = 0
-    QChart.ViewStart = maxStart
-    SetScrollRange(hScroll, SB_CTL, 0, maxStart, TRUE)
-    SetScrollPos(hScroll, SB_CTL, maxStart, TRUE)
-    DetectTimeframe()
-    ForceRedraw(hWnd)
+    pCD->Chart.ViewStart = maxStart
+    ' Mettre à jour le global QChart si c'est le graphe actif (pour compatibilité scrollbar)
+    If pCD->chartIdx = activeChartIdx Then
+        SetScrollRange(hScroll, SB_CTL, 0, maxStart, TRUE)
+        SetScrollPos(hScroll, SB_CTL, maxStart, TRUE)
+        ' Synchro globale QChart pour les sous-systèmes qui en ont encore besoin
+        QChart = pCD->Chart
+    End If
+    InvalidateRect(pCD->hwnd, NULL, FALSE)
+End Sub
+
+' ── Wrapper : charge dans le graphe actif (appelé depuis File > Ouvrir) ───────
+Sub LoadCSV(ByVal filename As String, hWnd As HWND)
+    Dim pCDA As ChartWinData Ptr = GetChartData(hCharts(activeChartIdx))
+    LoadCSVToChart(filename, pCDA, hWnd)
 End Sub
 
 Sub ForceRedraw(hWnd As HWND)
-    InvalidateRect(hWnd, NULL, FALSE)
+    ' Invalider toutes les fenêtres graphe visibles
+    Dim ci4 As Integer
+    For ci4 = 0 To MAX_CHARTS - 1
+        If hCharts(ci4) <> 0 Then InvalidateRect(hCharts(ci4), NULL, FALSE)
+    Next
+    If hCharts(0) = 0 Then InvalidateRect(hWnd, NULL, FALSE)
+End Sub
+
+' ── Ouvre la fenêtre Technicals pour un graphe donné (une seule instance) ────
+Sub OpenTechnicalsForChart(hParent As HWND, chartIdx As Integer)
+    ' Enregistrer la classe une seule fois (échec silencieux si déjà enregistrée)
+    Dim wcI As WNDCLASS
+    wcI.lpfnWndProc   = @IndicatorsDlgProc
+    wcI.hInstance     = GetModuleHandle(NULL)
+    wcI.hCursor       = LoadCursor(NULL, IDC_ARROW)
+    wcI.hbrBackground = GetStockObject(WHITE_BRUSH)
+    wcI.lpszClassName = StrPtr("IndWin")
+    RegisterClass(@wcI)
+
+    ' Vérifier qu'une fenêtre Technicals n'est pas déjà ouverte pour ce graphe
+    ' (chercher une fenêtre enfant de hParent de classe "IndWin" avec le même USERDATA)
+    Dim hExisting As HWND = GetWindow(hParent, GW_CHILD)
+    Do While hExisting <> 0
+        Dim clsName As ZString * 32
+        GetClassName(hExisting, @clsName, 32)
+        If clsName = "IndWin" Then
+            Dim existIdx As Long = GetWindowLongPtr(hExisting, GWLP_USERDATA)
+            If existIdx = chartIdx Then
+                ' Déjà ouverte — mettre au premier plan
+                SetForegroundWindow(hExisting)
+                BringWindowToTop(hExisting)
+                Return
+            End If
+        End If
+        hExisting = GetWindow(hExisting, GW_HWNDNEXT)
+    Loop
+
+    ' Créer la fenêtre
+    Dim hInd As HWND = CreateWindowEx(0, "IndWin", "Technicals", _
+        WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_VISIBLE, _
+        CW_USEDEFAULT, CW_USEDEFAULT, 260, 320, _
+        hParent, NULL, GetModuleHandle(NULL), Cast(Any Ptr, CInt(chartIdx)))
 End Sub
 
 ' ── Helpers de coordonnées canvas ─────────────────────────────────────────────
@@ -916,7 +1066,10 @@ Function HitTestPanelArea(mx As Integer, my As Integer) As Integer
     Return -1
 End Function
 
-Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
+Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer, pCD As ChartWinData Ptr)
+    ' Alias locaux vers les champs du graphe courant
+    ' Utilisation directe de pCD-> dans tout le corps de la fonction
+
     Dim rc As RECT
     rc.Left = 0 : rc.Top = 0 : rc.Right = w : rc.Bottom = h
     FillRect(hDC, @rc, GetStockObject(WHITE_BRUSH))
@@ -925,7 +1078,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     If GdipCreateFromHDC(hDC, @g) <> 0 Then Exit Sub
     GdipSetSmoothingMode(g, SmoothingModeAntiAlias)
 
-    If QChart.IsLoaded = 0 Then
+    If pCD->Chart.IsLoaded = 0 Then
         Dim msgText As String = "Fichier > Ouvrir pour charger les donnees"
         TextOut(hDC, (w + toolbarW)\2 - 150, h\2, msgText, Len(msgText))
         GdipDeleteGraphics(g) : Exit Sub
@@ -933,31 +1086,37 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
 
     ' Compter les panneaux séparés (isPanel=1) pour la hauteur
     Dim panelCount As Long = 0
-    For i As Integer = 0 To ActiveCount - 1
-        If indRegistry.defs(ActivePanels(i).defIndex).isPanel = 1 Then panelCount += 1
+    For i As Integer = 0 To pCD->ActiveCount - 1
+        If indRegistry.defs(pCD->ActivePanels(i).defIndex).isPanel = 1 Then panelCount += 1
     Next
     Dim As Integer rsiAreaH = panelCount * (RSI_PANEL_H + RSI_PANEL_GAP)
     Dim As Integer mainChartH = h - rsiAreaH - 40 - ZOOM_BAR_H
 
     ' 1. Echelle
-    g_vMin = 1e30 : g_vMax = -1e30
-    Dim As Integer lastIdx = QChart.ViewStart + QChart.ViewCount - 1
-    If lastIdx > UBound(QChart.History) Then lastIdx = UBound(QChart.History)
-    For i As Integer = QChart.ViewStart To lastIdx
-        If QChart.History(i).L < g_vMin Then g_vMin = QChart.History(i).L
-        If QChart.History(i).H > g_vMax Then g_vMax = QChart.History(i).H
+    pCD->vMin = 1e30 : pCD->vMax = -1e30
+    Dim As Integer lastIdx = pCD->Chart.ViewStart + pCD->Chart.ViewCount - 1
+    If lastIdx > UBound(pCD->Chart.History) Then lastIdx = UBound(pCD->Chart.History)
+    For i As Integer = pCD->Chart.ViewStart To lastIdx
+        If pCD->Chart.History(i).L < pCD->vMin Then pCD->vMin = pCD->Chart.History(i).L
+        If pCD->Chart.History(i).H > pCD->vMax Then pCD->vMax = pCD->Chart.History(i).H
     Next
-    g_vMin *= 0.999 : g_vMax *= 1.001
+    pCD->vMin *= 0.999 : pCD->vMax *= 1.001
 
-    g_oriX = 65 + toolbarW : g_oriY = mainChartH + ZOOM_BAR_H
+    pCD->oriX = 65 + toolbarW : pCD->oriY = mainChartH + ZOOM_BAR_H
     Dim As Single lenX = w - 120 - toolbarW
-    g_lenY = mainChartH - 40
-    g_scaleY = IIf(g_vMax - g_vMin <> 0, g_lenY / (g_vMax - g_vMin), 1)
-    g_stepX = lenX / QChart.ViewCount
+    pCD->lenY = mainChartH - 40
+    pCD->scaleY = IIf(pCD->vMax - pCD->vMin <> 0, pCD->lenY / (pCD->vMax - pCD->vMin), 1)
+    pCD->stepX = lenX / pCD->Chart.ViewCount
+
+    ' Mettre à jour les globales pour compatibilité avec les helpers (SnapToCandle, etc.)
+    g_vMin   = pCD->vMin   : g_vMax   = pCD->vMax
+    g_oriX   = pCD->oriX   : g_oriY   = pCD->oriY
+    g_lenY   = pCD->lenY   : g_scaleY = pCD->scaleY
+    g_stepX  = pCD->stepX
 
     ' 1a. Grille + labels axe Y
     Dim nYTicks As Integer = 6
-    Dim yRange As Double = g_vMax - g_vMin
+    Dim yRange As Double = pCD->vMax - pCD->vMin
     Dim rawStep As Double = yRange / nYTicks
     Dim mag As Double = 10 ^ Int(Log(rawStep) / Log(10))
     Dim niceStep As Double
@@ -971,17 +1130,17 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Else
         niceStep = 10 * mag
     End If
-    Dim firstTick As Double = Int(g_vMin / niceStep + 1) * niceStep
+    Dim firstTick As Double = Int(pCD->vMin / niceStep + 1) * niceStep
     Dim pGrid As GpPen Ptr : GdipCreatePen1(&HFFEEEEEE, 1.0, UnitPixel, @pGrid)
     Dim pAxis As GpPen Ptr : GdipCreatePen1(&HFFAAAAAA, 1.0, UnitPixel, @pAxis)
     SetBkMode(hDC, TRANSPARENT)
     SetTextColor(hDC, &H444444)
     Dim tick As Double = firstTick
-    Do While tick <= g_vMax
-        Dim yTick As Single = g_oriY - CSng((tick - g_vMin) * g_scaleY)
-        If yTick >= ZOOM_BAR_H + 40 And yTick <= g_oriY Then
-            GdipDrawLine(g, pGrid, g_oriX, yTick, g_oriX + lenX, yTick)
-            GdipDrawLine(g, pAxis, g_oriX - 4, yTick, g_oriX, yTick)
+    Do While tick <= pCD->vMax
+        Dim yTick As Single = pCD->oriY - CSng((tick - pCD->vMin) * pCD->scaleY)
+        If yTick >= ZOOM_BAR_H + 40 And yTick <= pCD->oriY Then
+            GdipDrawLine(g, pGrid, pCD->oriX, yTick, pCD->oriX + lenX, yTick)
+            GdipDrawLine(g, pAxis, pCD->oriX - 4, yTick, pCD->oriX, yTick)
             Dim priceStr As String
             If niceStep >= 1 Then
                 priceStr = Str(CLng(tick))
@@ -993,25 +1152,25 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
                 priceStr = Format(tick, "0.000")
             End If
             Dim txtW As Integer = Len(priceStr) * 6
-            TextOut(hDC, CInt(g_oriX) - txtW - 6, CInt(yTick) - 7, priceStr, Len(priceStr))
+            TextOut(hDC, CInt(pCD->oriX) - txtW - 6, CInt(yTick) - 7, priceStr, Len(priceStr))
         End If
         tick += niceStep
     Loop
-    GdipDrawLine(g, pAxis, g_oriX, ZOOM_BAR_H + 40, g_oriX, g_oriY)
+    GdipDrawLine(g, pAxis, pCD->oriX, ZOOM_BAR_H + 40, pCD->oriX, pCD->oriY)
     GdipDeletePen(pGrid) : GdipDeletePen(pAxis)
 
     ' 1b. Labels axe X
     Dim minSpacePx As Single = 70.0
-    Dim xStep As Integer = CInt(minSpacePx / g_stepX)
+    Dim xStep As Integer = CInt(minSpacePx / pCD->stepX)
     If xStep < 1 Then xStep = 1
     Dim pAxisX As GpPen Ptr : GdipCreatePen1(&HFFAAAAAA, 1.0, UnitPixel, @pAxisX)
-    GdipDrawLine(g, pAxisX, g_oriX, g_oriY, g_oriX + lenX, g_oriY)
+    GdipDrawLine(g, pAxisX, pCD->oriX, pCD->oriY, pCD->oriX + lenX, pCD->oriY)
     SetTextColor(hDC, &H444444)
-    Dim xi As Integer = QChart.ViewStart
+    Dim xi As Integer = pCD->Chart.ViewStart
     Do While xi <= lastIdx
-        Dim P As PriceData = QChart.History(xi)
-        Dim xPos As Single = g_oriX + (xi - QChart.ViewStart) * g_stepX + (g_stepX / 2)
-        GdipDrawLine(g, pAxisX, xPos, g_oriY, xPos, g_oriY + 4)
+        Dim P As PriceData = pCD->Chart.History(xi)
+        Dim xPos As Single = pCD->oriX + (xi - pCD->Chart.ViewStart) * pCD->stepX + (pCD->stepX / 2)
+        GdipDrawLine(g, pAxisX, xPos, pCD->oriY, xPos, pCD->oriY + 4)
         Dim xLbl As String
         Dim dtStr As String = Trim(P.Dt)
         Dim tmStr As String = Trim(P.Tm)
@@ -1025,20 +1184,20 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
             End If
         End If
         Dim lw As Integer = Len(xLbl) * 6
-        TextOut(hDC, CInt(xPos) - lw \ 2, g_oriY + 6, xLbl, Len(xLbl))
+        TextOut(hDC, CInt(xPos) - lw \ 2, pCD->oriY + 6, xLbl, Len(xLbl))
         xi += xStep
     Loop
     GdipDeletePen(pAxisX)
     SetTextColor(hDC, 0)
 
     ' 2. Bougies
-    For i As Integer = QChart.ViewStart To lastIdx
-        Dim Pb As PriceData = QChart.History(i)
-        Dim As Single x = g_oriX + (i - QChart.ViewStart) * g_stepX + (g_stepX/2)
-        Dim As Single yO = g_oriY - (Pb.O - g_vMin) * g_scaleY
-        Dim As Single yC = g_oriY - (Pb.C - g_vMin) * g_scaleY
-        Dim As Single yH = g_oriY - (Pb.H - g_vMin) * g_scaleY
-        Dim As Single yL = g_oriY - (Pb.L - g_vMin) * g_scaleY
+    For i As Integer = pCD->Chart.ViewStart To lastIdx
+        Dim Pb As PriceData = pCD->Chart.History(i)
+        Dim As Single x = pCD->oriX + (i - pCD->Chart.ViewStart) * pCD->stepX + (pCD->stepX/2)
+        Dim As Single yO = pCD->oriY - (Pb.O - pCD->vMin) * pCD->scaleY
+        Dim As Single yC = pCD->oriY - (Pb.C - pCD->vMin) * pCD->scaleY
+        Dim As Single yH = pCD->oriY - (Pb.H - pCD->vMin) * pCD->scaleY
+        Dim As Single yL = pCD->oriY - (Pb.L - pCD->vMin) * pCD->scaleY
         Dim col As UInteger
         If Pb.C >= Pb.O Then col = &HFF00C800 Else col = &HFFFF0000
         Dim penC As GpPen Ptr
@@ -1052,7 +1211,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Next
 
     ' 3. Rendu des indicateurs via le registre
-    Dim totalBars As Long = UBound(QChart.History) + 1
+    Dim totalBars As Long = UBound(pCD->Chart.History) + 1
     Dim Closes     (totalBars - 1) As Double
     Dim Opens      (totalBars - 1) As Double
     Dim Highs      (totalBars - 1) As Double
@@ -1061,13 +1220,13 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Dim Weekdays   (totalBars - 1) As Long
     Dim CurUnixTs  (totalBars - 1) As Double   ' timestamps Unix du TF courant
     For ci As Long = 0 To totalBars - 1
-        Closes  (ci) = QChart.History(ci).C
-        Opens   (ci) = QChart.History(ci).O
-        Highs   (ci) = QChart.History(ci).H
-        Lows    (ci) = QChart.History(ci).L
-        Volumes (ci) = CDbl(QChart.History(ci).V)
-        CurUnixTs(ci) = QChart.History(ci).Unix
-        Dim dtStr2 As String = Trim(QChart.History(ci).Dt)
+        Closes  (ci) = pCD->Chart.History(ci).C
+        Opens   (ci) = pCD->Chart.History(ci).O
+        Highs   (ci) = pCD->Chart.History(ci).H
+        Lows    (ci) = pCD->Chart.History(ci).L
+        Volumes (ci) = CDbl(pCD->Chart.History(ci).V)
+        CurUnixTs(ci) = pCD->Chart.History(ci).Unix
+        Dim dtStr2 As String = Trim(pCD->Chart.History(ci).Dt)
         If Len(dtStr2) >= 10 Then
             Dim yr As Integer = CInt(Mid(dtStr2, 1, 4))
             Dim mo As Integer = CInt(Mid(dtStr2, 6, 2))
@@ -1079,19 +1238,19 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Next
 
     ' Mise en cache des géométries pour le hit-test des trendlines
-    mainChartH_cached = mainChartH
-    PanelGeomCount = 0
+    pCD->mainChartH_cached = mainChartH
+    pCD->PanelGeomCount = 0
 
     ' Contexte graphique partagé
     Dim ctx As ChartCtx
-    ctx.oriX       = g_oriX
-    ctx.oriY       = g_oriY
-    ctx.stepX      = g_stepX
+    ctx.oriX       = pCD->oriX
+    ctx.oriY       = pCD->oriY
+    ctx.stepX      = pCD->stepX
     ctx.lenX       = lenX
-    ctx.vMin       = g_vMin
-    ctx.scaleY     = g_scaleY
+    ctx.vMin       = pCD->vMin
+    ctx.scaleY     = pCD->scaleY
     ctx.mainChartH = CLng(mainChartH)
-    ctx.viewStart  = CLng(QChart.ViewStart)
+    ctx.viewStart  = CLng(pCD->Chart.ViewStart)
     ctx.lastIdx    = CLng(lastIdx)
     ctx.refHighs      = NULL
     ctx.refLows       = NULL
@@ -1114,8 +1273,8 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Dim panelIdx         As Long = 0  ' index global parmi TOUS les panels séparés
 
     ' Première passe : overlays (dessinés sur les bougies)
-    For i As Integer = 0 To ActiveCount - 1
-        Dim defIdx As Long = ActivePanels(i).defIndex
+    For i As Integer = 0 To pCD->ActiveCount - 1
+        Dim defIdx As Long = pCD->ActivePanels(i).defIndex
         Dim def As IndicatorDef = indRegistry.defs(defIdx)
         If def.isPanel = 0 And def.drawOverlay <> 0 Then
 
@@ -1124,7 +1283,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
 
             If Len(Trim(def.param2Label)) > 0 Then
                 Dim refTF As Long = 0
-                Select Case ActivePanels(i).param2
+                Select Case pCD->ActivePanels(i).param2
                     Case 0 : refTF = 1440
                     Case 1 : refTF = 10080
                     Case 2 : refTF = 43200
@@ -1171,7 +1330,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
                         ctx.refTFMinutes  = refTF
 
                         def.drawOverlay(g, hDC, @Closes(0), @Opens(0), @Highs(0), @Lows(0), @Volumes(0), @Weekdays(0), totalBars, _
-                            ActivePanels(i).period, ActivePanels(i).param2, globalOverlayIdx, @ctx, CLng(RSI_CLOSE_BTN), @MA_Colors(0))
+                            pCD->ActivePanels(i).period, pCD->ActivePanels(i).param2, globalOverlayIdx, @ctx, CLng(RSI_CLOSE_BTN), @MA_Colors(0))
                         globalOverlayIdx += 1
                         ctx.refHighs = NULL : ctx.refLows = NULL : ctx.refOpens = NULL
                         ctx.refTimestamps = NULL : ctx.refCount = 0 : ctx.refTFMinutes = 0
@@ -1182,7 +1341,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
 
             ' Indicateur sans TF de référence — appel direct
             def.drawOverlay(g, hDC, @Closes(0), @Opens(0), @Highs(0), @Lows(0), @Volumes(0), @Weekdays(0), totalBars, _
-                ActivePanels(i).period, ActivePanels(i).param2, globalOverlayIdx, @ctx, CLng(RSI_CLOSE_BTN), @MA_Colors(0))
+                pCD->ActivePanels(i).period, pCD->ActivePanels(i).param2, globalOverlayIdx, @ctx, CLng(RSI_CLOSE_BTN), @MA_Colors(0))
             globalOverlayIdx += 1
         End If
     Next
@@ -1201,8 +1360,8 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Static cvdOpn1 (MAX_REF_BARS - 1) As Double
     Static cvdTS1  (MAX_REF_BARS - 1) As Double
 
-    For i As Integer = 0 To ActiveCount - 1
-        Dim defIdx As Long = ActivePanels(i).defIndex
+    For i As Integer = 0 To pCD->ActiveCount - 1
+        Dim defIdx As Long = pCD->ActivePanels(i).defIndex
         Dim def As IndicatorDef = indRegistry.defs(defIdx)
         If def.isPanel = 1 And def.drawPanel <> 0 Then
             Dim totalPanelCount As Long = CountPanels(defIdx)
@@ -1217,9 +1376,9 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
                 Dim cvdN As Long = UBound(QChart1.History) + 1
                 If cvdN > MAX_REF_BARS Then cvdN = MAX_REF_BARS
                 For rj As Long = 0 To cvdN - 1
-                    cvdVol1(rj) = QChart1.History(rj).V   ' volume → refHighs
-                    cvdCls1(rj) = QChart1.History(rj).C   ' close  → refLows
-                    cvdOpn1(rj) = QChart1.History(rj).O   ' open   → refOpens
+                    cvdVol1(rj) = QChart1.History(rj).V
+                    cvdCls1(rj) = QChart1.History(rj).C
+                    cvdOpn1(rj) = QChart1.History(rj).O
                     cvdTS1 (rj) = QChart1.History(rj).Unix
                 Next rj
                 ctx.refHighs      = @cvdVol1(0)
@@ -1231,46 +1390,44 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
             End If
 
             def.drawPanel(g, hDC, @Closes(0), @Opens(0), @Highs(0), @Lows(0), @Volumes(0), @Weekdays(0), totalBars, _
-                ActivePanels(i).period, ActivePanels(i).param2, panelIdx, totalPanelCount, _
+                pCD->ActivePanels(i).period, pCD->ActivePanels(i).param2, panelIdx, totalPanelCount, _
                 @ctx, CLng(RSI_PANEL_H), CLng(RSI_PANEL_GAP), CLng(RSI_CLOSE_BTN), _
                 @pVMin, @pVMax)
 
-            ' Réinitialiser ref après appel
             ctx.refHighs = NULL : ctx.refLows = NULL : ctx.refOpens = NULL
             ctx.refTimestamps = NULL : ctx.refCount = 0 : ctx.refTFMinutes = 0
 
-            ' Mémoriser la géométrie + espace de valeurs pour les trendlines
+            ' Mémoriser la géométrie pour le hit-test
             Dim pInnerH As Integer = RSI_PANEL_H - 20
-            PanelGeoms(PanelGeomCount).rTop           = mainChartH + RSI_PANEL_MARGIN + panelIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
-            PanelGeoms(PanelGeomCount).rBottom        = PanelGeoms(PanelGeomCount).rTop + pInnerH
-            PanelGeoms(PanelGeomCount).innerH         = pInnerH
-            PanelGeoms(PanelGeomCount).vMin           = pVMin
-            PanelGeoms(PanelGeomCount).vMax           = pVMax
-            PanelGeoms(PanelGeomCount).activePanelIdx = i
-            PanelGeomCount += 1
+            pCD->PanelGeoms(pCD->PanelGeomCount).rTop           = mainChartH + RSI_PANEL_MARGIN + panelIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
+            pCD->PanelGeoms(pCD->PanelGeomCount).rBottom        = pCD->PanelGeoms(pCD->PanelGeomCount).rTop + pInnerH
+            pCD->PanelGeoms(pCD->PanelGeomCount).innerH         = pInnerH
+            pCD->PanelGeoms(pCD->PanelGeomCount).vMin           = pVMin
+            pCD->PanelGeoms(pCD->PanelGeomCount).vMax           = pVMax
+            pCD->PanelGeoms(pCD->PanelGeomCount).activePanelIdx = i
+            pCD->PanelGeomCount += 1
             panelIdx += 1
         End If
     Next
 
     ' 4. Trendlines — rendu dans le bon canvas selon canvasType
     Dim pL As GpPen Ptr : GdipCreatePen1(&HFF444444, 2.0, UnitPixel, @pL)
-    For i As Integer = 0 To UBound(Lines)
-        Dim x1 As Single = g_oriX + (Lines(i).bar1 - QChart.ViewStart) * g_stepX + (g_stepX/2)
-        Dim y1 As Single = ValueToScreenY(Lines(i).price1, Lines(i).canvasType)
-        Dim x2 As Single = g_oriX + (Lines(i).bar2 - QChart.ViewStart) * g_stepX + (g_stepX/2)
-        Dim y2 As Single = ValueToScreenY(Lines(i).price2, Lines(i).canvasType)
+    For i As Integer = 0 To UBound(pCD->Lines)
+        Dim x1 As Single = pCD->oriX + (pCD->Lines(i).bar1 - pCD->Chart.ViewStart) * pCD->stepX + (pCD->stepX/2)
+        Dim y1 As Single = ValueToScreenY(pCD->Lines(i).price1, pCD->Lines(i).canvasType)
+        Dim x2 As Single = pCD->oriX + (pCD->Lines(i).bar2 - pCD->Chart.ViewStart) * pCD->stepX + (pCD->stepX/2)
+        Dim y2 As Single = ValueToScreenY(pCD->Lines(i).price2, pCD->Lines(i).canvasType)
         GdipDrawLine(g, pL, x1, y1, x2, y2)
     Next
-    If isDrawing = 1 Then
+    If pCD->isDrawing = 1 Then
         Dim mP As POINT : GetCursorPos(@mP) : ScreenToClient(hWnd, @mP)
-        ' Le snap ne s'applique que dans le graphe principal (canvasType=0)
-        If tmpCanvasType = 0 Then
+        If pCD->tmpCanvasType = 0 Then
             SnapToCandle(mP.x, mP.y)
         Else
             g_snapX = mP.x : g_snapY = mP.y
         End If
-        Dim x1snap As Single = g_oriX + (tmpBar - QChart.ViewStart) * g_stepX + (g_stepX/2)
-        Dim y1snap As Single = ValueToScreenY(tmpPrice, tmpCanvasType)
+        Dim x1snap As Single = pCD->oriX + (pCD->tmpBar - pCD->Chart.ViewStart) * pCD->stepX + (pCD->stepX/2)
+        Dim y1snap As Single = ValueToScreenY(pCD->tmpPrice, pCD->tmpCanvasType)
         GdipDrawLine(g, pL, x1snap, y1snap, g_snapX, g_snapY)
         Dim pSnap As GpPen Ptr : GdipCreatePen1(&HFF0088FF, 1.5, UnitPixel, @pSnap)
         GdipDrawEllipse(g, pSnap, g_snapX - 5, g_snapY - 5, 10, 10)
@@ -1278,18 +1435,16 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     End If
     GdipDeletePen(pL)
 
-    ' Dessiner les cercles sauvegardés (recalculés en pixels à chaque rendu)
-    If UBound(Circles) >= 0 Then
+    ' Dessiner les cercles sauvegardés
+    If UBound(pCD->Circles) >= 0 Then
         Dim pC As GpPen Ptr : GdipCreatePen1(&HFF444444, 2.0, UnitPixel, @pC)
-        For i As Integer = 0 To UBound(Circles)
-            ' Convertir les 3 points bar/price → pixels
-            Dim px1 As Single = g_oriX + (Circles(i).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim py1 As Single = ValueToScreenY(Circles(i).price1, 0)
-            Dim px2 As Single = g_oriX + (Circles(i).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim py2 As Single = ValueToScreenY(Circles(i).price2, 0)
-            Dim px3 As Single = g_oriX + (Circles(i).bar3 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim py3 As Single = ValueToScreenY(Circles(i).price3, 0)
-            ' Calcul du centre par intersection des médiatrices (algorithme original)
+        For i As Integer = 0 To UBound(pCD->Circles)
+            Dim px1 As Single = pCD->oriX + (pCD->Circles(i).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim py1 As Single = ValueToScreenY(pCD->Circles(i).price1, 0)
+            Dim px2 As Single = pCD->oriX + (pCD->Circles(i).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim py2 As Single = ValueToScreenY(pCD->Circles(i).price2, 0)
+            Dim px3 As Single = pCD->oriX + (pCD->Circles(i).bar3 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim py3 As Single = ValueToScreenY(pCD->Circles(i).price3, 0)
             Dim yda As Double = py2 - py1
             Dim xda As Double = px2 - px1
             Dim ydb As Double = py3 - py2
@@ -1314,24 +1469,19 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
         GdipDeletePen(pC)
     End If
 
-    ' Aperçu cercle en cours (points déjà cliqués en pixels courants)
-    If currentTool = ID_TOOL_CIRCLE And circleClickNb > 0 Then
+    ' Aperçu cercle en cours
+    If pCD->currentTool = ID_TOOL_CIRCLE And pCD->circleClickNb > 0 Then
         Dim pDot As GpPen Ptr : GdipCreatePen1(&HFF0088FF, 1.5, UnitPixel, @pDot)
         For i As Integer = 1 To circleClickNb
             ' Recalculer position pixel depuis bar/price stockés
-            Dim dotX As Single = g_oriX + (circleBar(i) - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim dotY As Single = ValueToScreenY(circlePrice(i), 0)
+            Dim dotX As Single = pCD->oriX + (pCD->circleBar(i) - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim dotY As Single = ValueToScreenY(pCD->circlePrice(i), 0)
             GdipDrawEllipse(g, pDot, dotX - 4, dotY - 4, 8, 8)
         Next
         GdipDeletePen(pDot)
     End If
 
     ' ── Fibonacci Fans ────────────────────────────────────────────────────
-    ' Algorithme standard (mode fibofanstandard) :
-    '   P1 = pivot, P2 = fin de ligne de base
-    '   dx = P2x - P1x  (pixels)
-    '   Rayon r : de P1 vers (P2x + dx*ratio, P2y)  → prolongé au bord
-    ' Ratios : 23.6=0.618*0.5, 38.2=0.618, 50=1.0, 61.8=1.618, 78.6=1.618²*1.382
     Dim fiboRatios(4) As Double
     fiboRatios(0) = 0.309   ' 23.6%
     fiboRatios(1) = 0.618   ' 38.2%
@@ -1345,14 +1495,14 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     fiboCols(0) = &HFF00AA88 : fiboCols(1) = &HFF0088CC : fiboCols(2) = &HFFCC8800
     fiboCols(3) = &HFFCC4400 : fiboCols(4) = &HFFCC0000
 
-    Dim chartRightX As Single = g_oriX + (winW - 120 - toolbarW)
+    Dim chartRightX As Single = pCD->oriX + (winW - 120 - toolbarW)
 
-    If UBound(FiboFans) >= 0 Then
-        For i As Integer = 0 To UBound(FiboFans)
-            Dim ffx1 As Single = g_oriX + (FiboFans(i).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim ffy1 As Single = ValueToScreenY(FiboFans(i).price1, 0)
-            Dim ffx2 As Single = g_oriX + (FiboFans(i).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            Dim ffy2 As Single = ValueToScreenY(FiboFans(i).price2, 0)
+    If UBound(pCD->FiboFans) >= 0 Then
+        For i As Integer = 0 To UBound(pCD->FiboFans)
+            Dim ffx1 As Single = pCD->oriX + (pCD->FiboFans(i).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim ffy1 As Single = ValueToScreenY(pCD->FiboFans(i).price1, 0)
+            Dim ffx2 As Single = pCD->oriX + (pCD->FiboFans(i).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            Dim ffy2 As Single = ValueToScreenY(pCD->FiboFans(i).price2, 0)
             Dim ffdx As Single = ffx2 - ffx1
 
             ' Ligne de base P1→P2 en tirets gris
@@ -1387,10 +1537,10 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     End If
 
     ' Aperçu FiboFan : 1er point posé, fan complet vers la souris en temps réel
-    If currentTool = ID_TOOL_FIBOFAN And fiboFanClickNb = 1 Then
+    If pCD->currentTool = ID_TOOL_FIBOFAN And pCD->fiboFanClickNb = 1 Then
         Dim mPF As POINT : GetCursorPos(@mPF) : ScreenToClient(hWnd, @mPF)
-        Dim fpx1 As Single = g_oriX + (fiboFanBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-        Dim fpy1 As Single = ValueToScreenY(fiboFanPrice1, 0)
+        Dim fpx1 As Single = pCD->oriX + (pCD->fiboFanBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+        Dim fpy1 As Single = ValueToScreenY(pCD->fiboFanPrice1, 0)
         Dim fpx2 As Single = CSng(mPF.x)
         Dim fpy2 As Single = CSng(mPF.y)
         Dim fpdx As Single = fpx2 - fpx1
@@ -1439,7 +1589,7 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     End If
 
     ' ── Gann Fans ─────────────────────────────────────────────────────────
-    Dim gannChartRight As Single = g_oriX + (winW - 120 - toolbarW)
+    Dim gannChartRight As Single = pCD->oriX + (winW - 120 - toolbarW)
     Dim gannCols(8) As ULong
     gannCols(0)=&HFFCC8800:gannCols(1)=&HFFCC6600:gannCols(2)=&HFFCC4400:gannCols(3)=&HFFCC2200
     gannCols(4)=&HFF888888:gannCols(5)=&HFF0066CC:gannCols(6)=&HFF0044CC:gannCols(7)=&HFF0022CC:gannCols(8)=&HFF0000CC
@@ -1454,18 +1604,18 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Dim gfRenderAlpha As Integer
     Dim gfPass As Integer
 
-    For gfPass = 0 To (UBound(GannFans) + 1) + 1
+    For gfPass = 0 To (UBound(pCD->GannFans) + 1) + 1
         ' gfPass 0..UBound = fans définitifs, dernier pass = aperçu si actif
-        If gfPass <= UBound(GannFans) Then
-            gfRenderX1 = g_oriX + (GannFans(gfPass).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            gfRenderY1 = ValueToScreenY(GannFans(gfPass).price1, 0)
-            gfRenderX2 = g_oriX + (GannFans(gfPass).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            gfRenderY2 = ValueToScreenY(GannFans(gfPass).price2, 0)
+        If gfPass <= UBound(pCD->GannFans) Then
+            gfRenderX1 = pCD->oriX + (pCD->GannFans(gfPass).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            gfRenderY1 = ValueToScreenY(pCD->GannFans(gfPass).price1, 0)
+            gfRenderX2 = pCD->oriX + (pCD->GannFans(gfPass).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            gfRenderY2 = ValueToScreenY(pCD->GannFans(gfPass).price2, 0)
             gfRenderAlpha = 255
-        ElseIf currentTool = ID_TOOL_GANNFAN And gannFanClickNb = 1 Then
+        ElseIf pCD->currentTool = ID_TOOL_GANNFAN And pCD->gannFanClickNb = 1 Then
             Dim mPG As POINT : GetCursorPos(@mPG) : ScreenToClient(hWnd, @mPG)
-            gfRenderX1 = g_oriX + (gannFanBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            gfRenderY1 = ValueToScreenY(gannFanPrice1, 0)
+            gfRenderX1 = pCD->oriX + (pCD->gannFanBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            gfRenderY1 = ValueToScreenY(pCD->gannFanPrice1, 0)
             gfRenderX2 = mPG.x
             gfRenderY2 = mPG.y
             gfRenderAlpha = 170
@@ -1545,17 +1695,17 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Dim frRAlpha As Integer
     Dim frPass   As Integer
 
-    For frPass = 0 To (UBound(FiboRets) + 1) + 1
-        If frPass <= UBound(FiboRets) Then
-            frRX1    = g_oriX + (FiboRets(frPass).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            frRY1    = ValueToScreenY(FiboRets(frPass).price1, 0)
-            frRX2    = g_oriX + (FiboRets(frPass).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            frRY2    = ValueToScreenY(FiboRets(frPass).price2, 0)
+    For frPass = 0 To (UBound(pCD->FiboRets) + 1) + 1
+        If frPass <= UBound(pCD->FiboRets) Then
+            frRX1    = pCD->oriX + (pCD->FiboRets(frPass).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            frRY1    = ValueToScreenY(pCD->FiboRets(frPass).price1, 0)
+            frRX2    = pCD->oriX + (pCD->FiboRets(frPass).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            frRY2    = ValueToScreenY(pCD->FiboRets(frPass).price2, 0)
             frRAlpha = 255
-        ElseIf currentTool = ID_TOOL_FIBORET And fiboRetClickNb = 1 Then
+        ElseIf pCD->currentTool = ID_TOOL_FIBORET And pCD->fiboRetClickNb = 1 Then
             Dim mPFR As POINT : GetCursorPos(@mPFR) : ScreenToClient(hWnd, @mPFR)
-            frRX1    = g_oriX + (fiboRetBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            frRY1    = ValueToScreenY(fiboRetPrice1, 0)
+            frRX1    = pCD->oriX + (pCD->fiboRetBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            frRY1    = ValueToScreenY(pCD->fiboRetPrice1, 0)
             frRX2    = CSng(mPFR.x)
             frRY2    = CSng(mPFR.y)
             frRAlpha = 170
@@ -1628,17 +1778,17 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Const GGRID_ITER = 12   ' nombre d'itérations (réduit de 20 pour perf)
     Const GGRID_PI   = 3.14159265358979
 
-    For ggPass = 0 To (UBound(GannGrids) + 1) + 1
-        If ggPass <= UBound(GannGrids) Then
-            ggRX1    = g_oriX + (GannGrids(ggPass).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ggRY1    = ValueToScreenY(GannGrids(ggPass).price1, 0)
-            ggRX2    = g_oriX + (GannGrids(ggPass).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ggRY2    = ValueToScreenY(GannGrids(ggPass).price2, 0)
+    For ggPass = 0 To (UBound(pCD->GannGrids) + 1) + 1
+        If ggPass <= UBound(pCD->GannGrids) Then
+            ggRX1    = pCD->oriX + (pCD->GannGrids(ggPass).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ggRY1    = ValueToScreenY(pCD->GannGrids(ggPass).price1, 0)
+            ggRX2    = pCD->oriX + (pCD->GannGrids(ggPass).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ggRY2    = ValueToScreenY(pCD->GannGrids(ggPass).price2, 0)
             ggRAlpha = 255
-        ElseIf currentTool = ID_TOOL_GANNGRID And gannGridClickNb = 1 Then
+        ElseIf pCD->currentTool = ID_TOOL_GANNGRID And pCD->gannGridClickNb = 1 Then
             Dim mPGG As POINT : GetCursorPos(@mPGG) : ScreenToClient(hWnd, @mPGG)
-            ggRX1    = g_oriX + (gannGridBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ggRY1    = ValueToScreenY(gannGridPrice1, 0)
+            ggRX1    = pCD->oriX + (pCD->gannGridBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ggRY1    = ValueToScreenY(pCD->gannGridPrice1, 0)
             ggRX2    = CSng(mPGG.x)
             ggRY2    = CSng(mPGG.y)
             ggRAlpha = 170
@@ -1749,17 +1899,17 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     Dim ptRAlpha As Integer
     Dim ptPass   As Integer
 
-    For ptPass = 0 To (UBound(Pentagrams) + 1) + 1
-        If ptPass <= UBound(Pentagrams) Then
-            ptRX1    = g_oriX + (Pentagrams(ptPass).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ptRY1    = ValueToScreenY(Pentagrams(ptPass).price1, 0)
-            ptRX2    = g_oriX + (Pentagrams(ptPass).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ptRY2    = ValueToScreenY(Pentagrams(ptPass).price2, 0)
+    For ptPass = 0 To (UBound(pCD->Pentagrams) + 1) + 1
+        If ptPass <= UBound(pCD->Pentagrams) Then
+            ptRX1    = pCD->oriX + (pCD->Pentagrams(ptPass).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ptRY1    = ValueToScreenY(pCD->Pentagrams(ptPass).price1, 0)
+            ptRX2    = pCD->oriX + (pCD->Pentagrams(ptPass).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ptRY2    = ValueToScreenY(pCD->Pentagrams(ptPass).price2, 0)
             ptRAlpha = 255
-        ElseIf currentTool = ID_TOOL_PENTAGRAM And pentaClickNb = 1 Then
+        ElseIf pCD->currentTool = ID_TOOL_PENTAGRAM And pCD->pentaClickNb = 1 Then
             Dim mPPT As POINT : GetCursorPos(@mPPT) : ScreenToClient(hWnd, @mPPT)
-            ptRX1    = g_oriX + (pentaBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            ptRY1    = ValueToScreenY(pentaPrice1, 0)
+            ptRX1    = pCD->oriX + (pCD->pentaBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            ptRY1    = ValueToScreenY(pCD->pentaPrice1, 0)
             ptRX2    = CSng(mPPT.x)
             ptRY2    = CSng(mPPT.y)
             ptRAlpha = 170
@@ -1830,29 +1980,29 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
     ' Helper : prolonger une ligne définie par (lx1,ly1)→(lx1+ldx,ly1+ldy) jusqu'aux bords
     ' Retourne les points d'intersection avec les bords du graphe
 
-    Dim plChartRight As Single = g_oriX + (winW - 120 - toolbarW)
-    Dim plChartLeft  As Single = g_oriX
+    Dim plChartRight As Single = pCD->oriX + (winW - 120 - toolbarW)
+    Dim plChartLeft  As Single = pCD->oriX
 
     Dim As Single plRX1, plRY1, plRX2, plRY2, plRX3, plRY3
     Dim plRAlpha As Integer
     Dim plPass   As Integer
 
-    For plPass = 0 To (UBound(ParaLinesArr) + 1) + 2
-        If plPass <= UBound(ParaLinesArr) Then
-            plRX1    = g_oriX + (ParaLinesArr(plPass).bar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            plRY1    = ValueToScreenY(ParaLinesArr(plPass).price1, 0)
-            plRX2    = g_oriX + (ParaLinesArr(plPass).bar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            plRY2    = ValueToScreenY(ParaLinesArr(plPass).price2, 0)
-            plRX3    = g_oriX + (ParaLinesArr(plPass).bar3 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            plRY3    = ValueToScreenY(ParaLinesArr(plPass).price3, 0)
+    For plPass = 0 To (UBound(pCD->ParaLinesArr) + 1) + 2
+        If plPass <= UBound(pCD->ParaLinesArr) Then
+            plRX1    = pCD->oriX + (pCD->ParaLinesArr(plPass).bar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            plRY1    = ValueToScreenY(pCD->ParaLinesArr(plPass).price1, 0)
+            plRX2    = pCD->oriX + (pCD->ParaLinesArr(plPass).bar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            plRY2    = ValueToScreenY(pCD->ParaLinesArr(plPass).price2, 0)
+            plRX3    = pCD->oriX + (pCD->ParaLinesArr(plPass).bar3 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            plRY3    = ValueToScreenY(pCD->ParaLinesArr(plPass).price3, 0)
             plRAlpha = 255
-        ElseIf currentTool = ID_TOOL_PARALINES And paraClickNb >= 1 Then
+        ElseIf pCD->currentTool = ID_TOOL_PARALINES And pCD->paraClickNb >= 1 Then
             Dim mPPL As POINT : GetCursorPos(@mPPL) : ScreenToClient(hWnd, @mPPL)
-            plRX1    = g_oriX + (paraBar1 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-            plRY1    = ValueToScreenY(paraPrice1, 0)
-            If paraClickNb >= 2 Then
-                plRX2 = g_oriX + (paraBar2 - QChart.ViewStart) * g_stepX + g_stepX * 0.5
-                plRY2 = ValueToScreenY(paraPrice2, 0)
+            plRX1    = pCD->oriX + (pCD->paraBar1 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+            plRY1    = ValueToScreenY(pCD->paraPrice1, 0)
+            If pCD->paraClickNb >= 2 Then
+                plRX2 = pCD->oriX + (pCD->paraBar2 - pCD->Chart.ViewStart) * pCD->stepX + pCD->stepX * 0.5
+                plRY2 = ValueToScreenY(pCD->paraPrice2, 0)
             Else
                 plRX2 = mPPL.x : plRY2 = mPPL.y
             End If
@@ -1927,38 +2077,35 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
         End If
     Next plPass
 
-    If currentTool = ID_TOOL_CROSSHAIR And crosshairX >= 0 And QChart.IsLoaded Then
-        Dim cx As Single = crosshairX
-        Dim cy As Single = crosshairY
+    If pCD->currentTool = ID_TOOL_CROSSHAIR And pCD->crosshairX >= 0 And pCD->Chart.IsLoaded Then
+        Dim cx As Single = pCD->crosshairX
+        Dim cy As Single = pCD->crosshairY
 
-        Dim chartLeft  As Single = g_oriX
-        Dim chartRight As Single = g_oriX + lenX
+        Dim chartLeft  As Single = pCD->oriX
+        Dim chartRight As Single = pCD->oriX + lenX
         Dim chartTop   As Single = ZOOM_BAR_H + 40
-        Dim chartBot   As Single = g_oriY
+        Dim chartBot   As Single = pCD->oriY
 
         ' Barre pointée par X (commune à tous les canvas)
-        Dim barUnder As Integer = QChart.ViewStart + CInt((cx - g_oriX) / g_stepX)
-        If barUnder < QChart.ViewStart Then barUnder = QChart.ViewStart
+        Dim barUnder As Integer = pCD->Chart.ViewStart + CInt((cx - pCD->oriX) / pCD->stepX)
+        If barUnder < pCD->Chart.ViewStart Then barUnder = pCD->Chart.ViewStart
         If barUnder > lastIdx Then barUnder = lastIdx
 
         If cx >= chartLeft And cx <= chartRight Then
 
-            ' Créer le stylo pointillé une seule fois pour tous les canvas
             Dim pCross As GpPen Ptr
             GdipCreatePen1(&HFF555555, 1.0, UnitPixel, @pCross)
-            GdipSetPenDashStyle(pCross, 2)   ' DashStyleDot
+            GdipSetPenDashStyle(pCross, 2)
 
             SetBkMode(hDC, TRANSPARENT)
 
             ' ── Graphe principal ─────────────────────────────────────────────
             If cy >= chartTop And cy <= chartBot Then
-                ' Ligne horizontale dans le graphe principal
                 GdipDrawLine(g, pCross, chartLeft, cy, chartRight, cy)
 
-                ' Label prix sur la droite
-                Dim crossPrice As Double = g_vMin + (g_oriY - cy) / g_scaleY
+                Dim crossPrice As Double = pCD->vMin + (pCD->oriY - cy) / pCD->scaleY
                 Dim priceStr As String
-                Dim priceRange As Double = g_vMax - g_vMin
+                Dim priceRange As Double = pCD->vMax - pCD->vMin
                 If priceRange >= 100 Then
                     priceStr = Str(CLng(crossPrice))
                 ElseIf priceRange >= 1 Then
@@ -1977,42 +2124,34 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
                 TextOut(hDC, CInt(priceLblX) + 4, CInt(priceLblY) + 2, priceStr, Len(priceStr))
             End If
 
-            ' Ligne verticale couvrant le graphe principal
             GdipDrawLine(g, pCross, cx, chartTop, cx, chartBot)
 
             ' ── Panels séparés ───────────────────────────────────────────────
-            For pi As Integer = 0 To PanelGeomCount - 1
-                Dim pTop    As Single = PanelGeoms(pi).rTop
-                Dim pBot    As Single = PanelGeoms(pi).rBottom
-                Dim pInnerH As Integer = PanelGeoms(pi).innerH
-                Dim pVMin   As Double  = PanelGeoms(pi).vMin
-                Dim pVMax   As Double  = PanelGeoms(pi).vMax
+            For pi As Integer = 0 To pCD->PanelGeomCount - 1
+                Dim pTop    As Single = pCD->PanelGeoms(pi).rTop
+                Dim pBot    As Single = pCD->PanelGeoms(pi).rBottom
+                Dim pInnerH2 As Integer = pCD->PanelGeoms(pi).innerH
+                Dim pVMin2  As Double  = pCD->PanelGeoms(pi).vMin
+                Dim pVMax2  As Double  = pCD->PanelGeoms(pi).vMax
 
-                ' Ligne verticale dans ce panel
                 GdipDrawLine(g, pCross, cx, pTop, cx, pBot)
 
-                ' Valeur Y sous le curseur dans ce panel
-                ' Si le curseur est dans ce panel, utiliser cy ; sinon interpoler depuis la barre
                 Dim panelCy As Single
                 If cy >= pTop And cy <= pBot Then
                     panelCy = cy
                 Else
-                    ' Pas de ligne horizontale si la souris n'est pas dans ce panel
                     Continue For
                 End If
 
-                ' Ligne horizontale dans ce panel
                 GdipDrawLine(g, pCross, chartLeft, panelCy, chartRight, panelCy)
 
-                ' Valeur dans l'espace du panel
                 Dim panelVal As Double = 0
-                If pInnerH > 0 And pVMax <> pVMin Then
-                    panelVal = pVMin + (pBot - panelCy) * (pVMax - pVMin) / pInnerH
+                If pInnerH2 > 0 And pVMax2 <> pVMin2 Then
+                    panelVal = pVMin2 + (pBot - panelCy) * (pVMax2 - pVMin2) / pInnerH2
                 End If
 
-                ' Label valeur sur la droite
                 Dim valStr As String
-                Dim valRange As Double = pVMax - pVMin
+                Dim valRange As Double = pVMax2 - pVMin2
                 If valRange >= 100 Then
                     valStr = Format(panelVal, "0.0")
                 ElseIf valRange >= 1 Then
@@ -2034,11 +2173,10 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
 
             GdipDeletePen(pCross)
 
-            ' ── Label Date/Heure (sous le dernier panel ou sous le graphe) ───
             Dim dtLbl As String = ""
-            If barUnder >= 0 And barUnder <= UBound(QChart.History) Then
-                Dim dtS As String = Trim(QChart.History(barUnder).Dt)
-                Dim tmS As String = Trim(QChart.History(barUnder).Tm)
+            If barUnder >= 0 And barUnder <= UBound(pCD->Chart.History) Then
+                Dim dtS As String = Trim(pCD->Chart.History(barUnder).Dt)
+                Dim tmS As String = Trim(pCD->Chart.History(barUnder).Tm)
                 If Len(tmS) >= 4 And tmS <> "00:00" Then
                     dtLbl = dtS & " " & tmS
                 Else
@@ -2047,10 +2185,9 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer)
             End If
 
             If Len(dtLbl) > 0 Then
-                ' Positionner sous le canvas le plus bas (dernier panel ou graphe principal)
                 Dim dtBaseY As Single = chartBot
-                If PanelGeomCount > 0 Then
-                    dtBaseY = PanelGeoms(PanelGeomCount - 1).rBottom
+                If pCD->PanelGeomCount > 0 Then
+                    dtBaseY = pCD->PanelGeoms(pCD->PanelGeomCount - 1).rBottom
                 End If
 
                 Dim dtLblW As Integer = Len(dtLbl) * 7 + 8
@@ -2118,6 +2255,11 @@ Function ParamsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As L
                 If newPer > 999 Then newPer = 999
                 If rightClickedOverlayIdx >= 0 And rightClickedOverlayIdx < ActiveCount Then
                     ActivePanels(rightClickedOverlayIdx).period = newPer
+                    ' Propager au graphe actif
+                    Dim pCDP As ChartWinData Ptr = GetChartData(hCharts(activeChartIdx))
+                    If pCDP <> NULL And rightClickedOverlayIdx < pCDP->ActiveCount Then
+                        pCDP->ActivePanels(rightClickedOverlayIdx).period = newPer
+                    End If
                     ForceRedraw(GetWindow(hWnd, GW_OWNER))
                 End If
                 DestroyWindow(hWnd)
@@ -2130,62 +2272,62 @@ Function ParamsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As L
 End Function
 
 Function IndicatorsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
-    Static hList      As HWND
-    Static hLblParams As HWND
-    Static hLbl1      As HWND
-    Static hEdt1      As HWND
-    Static hLbl2      As HWND
-    Static hEdt2      As HWND
-    Static hBtnApply  As HWND
 
     Select Case uMsg
         Case WM_CREATE
-            hList = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", "", _
+            ' lpCreateParams contient l'index du graphe cible (passé via CreateWindowEx)
+            Dim pCS As CREATESTRUCT Ptr = Cast(CREATESTRUCT Ptr, lParam)
+            Dim targetIdx As Long = CLng(CInt(pCS->lpCreateParams))
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, targetIdx)
+            ' Titre indiquant le graphe cible
+            Dim winTitle As String = "Technicals - Graphe " & (targetIdx + 1)
+            Dim zWinTitle As ZString * 40 : zWinTitle = winTitle
+            SetWindowText(hWnd, @zWinTitle)
+
+            Dim hList As HWND = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", "", _
                 WS_CHILD Or WS_VISIBLE Or WS_VSCROLL Or LBS_NOTIFY, _
                 10, 10, 200, 100, hWnd, Cast(HMENU, ID_LST_INDICATORS), _
                 GetModuleHandle(NULL), NULL)
-            ' Peupler la liste depuis le registre
             For i As Integer = 0 To indRegistry.count - 1
                 Dim nm As String = indRegistry.defs(i).name
                 SendMessage(hList, LB_ADDSTRING, 0, Cast(LPARAM, StrPtr(nm)))
             Next
-            hLblParams = CreateWindowEx(0, "STATIC", "-- Parametres --", _
+            CreateWindowEx(0, "STATIC", "-- Parametres --", _
                 WS_CHILD Or WS_VISIBLE Or SS_CENTER, 10, 120, 200, 16, hWnd, _
                 Cast(HMENU, ID_LBL_PARAMS), GetModuleHandle(NULL), NULL)
-            hLbl1 = CreateWindowEx(0, "STATIC", "Periode :", _
+            CreateWindowEx(0, "STATIC", "Periode :", _
                 WS_CHILD Or WS_VISIBLE, 10, 144, 80, 20, hWnd, _
                 Cast(HMENU, ID_LBL_PERIOD), GetModuleHandle(NULL), NULL)
-            hEdt1 = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "20", _
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "20", _
                 WS_CHILD Or WS_VISIBLE Or ES_NUMBER, 95, 142, 60, 22, hWnd, _
                 Cast(HMENU, ID_EDT_PERIOD), GetModuleHandle(NULL), NULL)
-            SendMessage(hEdt1, EM_SETLIMITTEXT, 4, 0)
-            hLbl2 = CreateWindowEx(0, "STATIC", "", WS_CHILD, _
+            SendMessage(GetDlgItem(hWnd, ID_EDT_PERIOD), EM_SETLIMITTEXT, 4, 0)
+            CreateWindowEx(0, "STATIC", "", WS_CHILD, _
                 10, 172, 80, 20, hWnd, Cast(HMENU, ID_LBL_PERIOD2), GetModuleHandle(NULL), NULL)
-            hEdt2 = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD Or ES_NUMBER, _
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD Or ES_NUMBER, _
                 95, 170, 60, 22, hWnd, Cast(HMENU, ID_EDT_PERIOD2), GetModuleHandle(NULL), NULL)
-            hBtnApply = CreateWindowEx(0, "BUTTON", "Appliquer", _
+            CreateWindowEx(0, "BUTTON", "Appliquer", _
                 WS_CHILD Or WS_VISIBLE, 45, 202, 130, 30, hWnd, _
                 Cast(HMENU, ID_BTN_APPLY), GetModuleHandle(NULL), NULL)
-            SendMessage(hList, LB_SETCURSEL, 0, 0)
+            SendMessage(GetDlgItem(hWnd, ID_LST_INDICATORS), LB_SETCURSEL, 0, 0)
             If indRegistry.count > 0 Then
                 Dim defPer As Long = indRegistry.defs(0).defaultPeriod
                 Dim buf0 As ZString * 8 : buf0 = Str(defPer)
-                SetWindowText(hEdt1, @buf0)
+                SetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD), @buf0)
                 Dim lbl0 As String = "Periode " & indRegistry.defs(0).labelPrefix & " :"
                 Dim zlbl0 As ZString * 32 : zlbl0 = lbl0
-                SetWindowText(hLbl1, @zlbl0)
-                ' Param2 : afficher si défini
+                SetWindowText(GetDlgItem(hWnd, ID_LBL_PERIOD), @zlbl0)
                 Dim p2lbl0 As String = Trim(indRegistry.defs(0).param2Label)
                 If Len(p2lbl0) > 0 Then
                     Dim zp2lbl0 As ZString * 32 : zp2lbl0 = p2lbl0
-                    SetWindowText(hLbl2, @zp2lbl0)
+                    SetWindowText(GetDlgItem(hWnd, ID_LBL_PERIOD2), @zp2lbl0)
                     Dim buf2 As ZString * 8 : buf2 = Str(indRegistry.defs(0).defaultParam2)
-                    SetWindowText(hEdt2, @buf2)
-                    ShowWindow(hLbl2, SW_SHOW)
-                    ShowWindow(hEdt2, SW_SHOW)
+                    SetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD2), @buf2)
+                    ShowWindow(GetDlgItem(hWnd, ID_LBL_PERIOD2), SW_SHOW)
+                    ShowWindow(GetDlgItem(hWnd, ID_EDT_PERIOD2), SW_SHOW)
                 Else
-                    ShowWindow(hLbl2, SW_HIDE)
-                    ShowWindow(hEdt2, SW_HIDE)
+                    ShowWindow(GetDlgItem(hWnd, ID_LBL_PERIOD2), SW_HIDE)
+                    ShowWindow(GetDlgItem(hWnd, ID_EDT_PERIOD2), SW_HIDE)
                 End If
             End If
 
@@ -2194,55 +2336,62 @@ Function IndicatorsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam 
             Dim cmdEvt As Integer = Hiword(wParam)
 
             If cmdId = ID_LST_INDICATORS And cmdEvt = LBN_SELCHANGE Then
-                Dim selIdx As Integer = SendMessage(hList, LB_GETCURSEL, 0, 0)
+                Dim selIdx As Integer = SendMessage(GetDlgItem(hWnd, ID_LST_INDICATORS), LB_GETCURSEL, 0, 0)
                 If selIdx >= 0 And selIdx < indRegistry.count Then
-                    ' Paramètre 1 (période)
                     Dim defPer As Long = indRegistry.defs(selIdx).defaultPeriod
                     Dim buf As ZString * 8 : buf = Str(defPer)
-                    SetWindowText(hEdt1, @buf)
+                    SetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD), @buf)
                     Dim lbl As String = "Periode " & indRegistry.defs(selIdx).labelPrefix & " :"
                     Dim zlbl As ZString * 32 : zlbl = lbl
-                    SetWindowText(hLbl1, @zlbl)
-                    ' Paramètre 2 : visible seulement si param2Label est renseigné
+                    SetWindowText(GetDlgItem(hWnd, ID_LBL_PERIOD), @zlbl)
                     Dim p2lbl As String = Trim(indRegistry.defs(selIdx).param2Label)
                     If Len(p2lbl) > 0 Then
                         Dim zp2lbl As ZString * 32 : zp2lbl = p2lbl
-                        SetWindowText(hLbl2, @zp2lbl)
+                        SetWindowText(GetDlgItem(hWnd, ID_LBL_PERIOD2), @zp2lbl)
                         Dim buf2 As ZString * 8 : buf2 = Str(indRegistry.defs(selIdx).defaultParam2)
-                        SetWindowText(hEdt2, @buf2)
-                        ShowWindow(hLbl2, SW_SHOW)
-                        ShowWindow(hEdt2, SW_SHOW)
+                        SetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD2), @buf2)
+                        ShowWindow(GetDlgItem(hWnd, ID_LBL_PERIOD2), SW_SHOW)
+                        ShowWindow(GetDlgItem(hWnd, ID_EDT_PERIOD2), SW_SHOW)
                     Else
-                        ShowWindow(hLbl2, SW_HIDE)
-                        ShowWindow(hEdt2, SW_HIDE)
+                        ShowWindow(GetDlgItem(hWnd, ID_LBL_PERIOD2), SW_HIDE)
+                        ShowWindow(GetDlgItem(hWnd, ID_EDT_PERIOD2), SW_HIDE)
                     End If
                 End If
             End If
 
             If cmdId = ID_BTN_APPLY Then
-                Dim selIdx2 As Integer = SendMessage(hList, LB_GETCURSEL, 0, 0)
+                Dim selIdx2 As Integer = SendMessage(GetDlgItem(hWnd, ID_LST_INDICATORS), LB_GETCURSEL, 0, 0)
                 If selIdx2 = LB_ERR Or selIdx2 >= indRegistry.count Then Return 0
-                ' Lire période
                 Dim eBuf As ZString * 8
-                GetWindowText(hEdt1, @eBuf, 8)
+                GetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD), @eBuf, 8)
                 Dim per As Long = Val(eBuf)
                 If per < 1   Then per = 1
                 If per > 999 Then per = 999
-                ' Lire param2 si visible
                 Dim p2 As Long = 0
                 Dim p2lbl2 As String = Trim(indRegistry.defs(selIdx2).param2Label)
                 If Len(p2lbl2) > 0 Then
                     Dim eBuf2 As ZString * 8
-                    GetWindowText(hEdt2, @eBuf2, 8)
+                    GetWindowText(GetDlgItem(hWnd, ID_EDT_PERIOD2), @eBuf2, 8)
                     p2 = Val(eBuf2)
                 End If
-                ActiveCount += 1
-                ReDim Preserve ActivePanels(ActiveCount - 1)
-                ActivePanels(ActiveCount - 1).defIndex = selIdx2
-                ActivePanels(ActiveCount - 1).period   = per
-                ActivePanels(ActiveCount - 1).param2   = p2
-                ForceRedraw(GetWindow(hWnd, GW_OWNER))
-                DestroyWindow(hWnd)
+                ' Récupérer le graphe cible depuis GWLP_USERDATA
+                Dim tgtIdx As Long = GetWindowLongPtr(hWnd, GWLP_USERDATA)
+                Dim pCDA As ChartWinData Ptr = GetChartData(hCharts(tgtIdx))
+                If pCDA <> NULL Then
+                    pCDA->ActiveCount += 1
+                    ReDim Preserve pCDA->ActivePanels(pCDA->ActiveCount - 1)
+                    pCDA->ActivePanels(pCDA->ActiveCount - 1).defIndex = selIdx2
+                    pCDA->ActivePanels(pCDA->ActiveCount - 1).period   = per
+                    pCDA->ActivePanels(pCDA->ActiveCount - 1).param2   = p2
+                End If
+                ' Synchro globale ActivePanels pour compatibilité
+                ActiveCount = pCDA->ActiveCount
+                ReDim ActivePanels(ActiveCount - 1)
+                Dim sj As Integer
+                For sj = 0 To ActiveCount - 1
+                    ActivePanels(sj) = pCDA->ActivePanels(sj)
+                Next
+                InvalidateRect(hCharts(tgtIdx), NULL, FALSE)
             End If
 
         Case WM_CLOSE : DestroyWindow(hWnd)
@@ -2250,15 +2399,744 @@ Function IndicatorsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam 
     Return DefWindowProc(hWnd, uMsg, wParam, lParam)
 End Function
 
+' ── Helper : récupère les données d'une fenêtre graphe enfant ────────────────
+Function GetChartData(hWnd As HWND) As ChartWinData Ptr
+    Return Cast(ChartWinData Ptr, GetWindowLongPtr(hWnd, GWLP_USERDATA))
+End Function
+
+' ── Dispose les fenêtres enfant selon le nombre de graphes ───────────────────
+Sub ArrangeChartWindows(hParent As HWND)
+    Dim rc As RECT
+    GetClientRect(hParent, @rc)
+    Dim cLeft  As Long = toolbarW
+    Dim cTop   As Long = ZOOM_BAR_H
+    Dim cW     As Long = rc.right  - toolbarW
+    Dim cH     As Long = rc.bottom - ZOOM_BAR_H - SCROLL_H
+
+    Select Case chartCount
+        Case 1
+            If hCharts(0) <> 0 Then MoveWindow(hCharts(0), cLeft, cTop, cW, cH, TRUE)
+        Case 2
+            Dim hw As Long = cW \ 2
+            If hCharts(0) <> 0 Then MoveWindow(hCharts(0), cLeft,      cTop, hw,      cH, TRUE)
+            If hCharts(1) <> 0 Then MoveWindow(hCharts(1), cLeft + hw, cTop, cW - hw, cH, TRUE)
+        Case 4
+            Dim hw2 As Long = cW \ 2
+            Dim hh  As Long = cH \ 2
+            If hCharts(0) <> 0 Then MoveWindow(hCharts(0), cLeft,       cTop,       hw2,      hh,      TRUE)
+            If hCharts(1) <> 0 Then MoveWindow(hCharts(1), cLeft + hw2, cTop,       cW - hw2, hh,      TRUE)
+            If hCharts(2) <> 0 Then MoveWindow(hCharts(2), cLeft,       cTop + hh,  hw2,      cH - hh, TRUE)
+            If hCharts(3) <> 0 Then MoveWindow(hCharts(3), cLeft + hw2, cTop + hh,  cW - hw2, cH - hh, TRUE)
+    End Select
+End Sub
+
+' ── Change le nombre de graphes actifs ───────────────────────────────────────
+Sub SetChartCount(hParent As HWND, n As Integer)
+    Dim i As Integer
+    For i = 0 To MAX_CHARTS - 1
+        If hCharts(i) <> 0 Then ShowWindow(hCharts(i), SW_HIDE)
+    Next
+    chartCount = n
+    Dim hInst As HINSTANCE = GetModuleHandle(NULL)
+    For i = 0 To n - 1
+        If hCharts(i) = 0 Then
+            hCharts(i) = CreateWindowEx(0, "QChartWnd", "", _
+                WS_CHILD Or WS_VISIBLE Or WS_BORDER, _
+                0, 0, 100, 100, hParent, Cast(HMENU, i), hInst, NULL)
+            Dim pCDi As ChartWinData Ptr = GetChartData(hCharts(i))
+            If pCDi <> NULL Then pCDi->chartIdx = i
+        Else
+            ShowWindow(hCharts(i), SW_SHOW)
+            Dim pCDi As ChartWinData Ptr = GetChartData(hCharts(i))
+            If pCDi <> NULL Then pCDi->chartIdx = i
+        End If
+    Next
+    ArrangeChartWindows(hParent)
+    activeChartIdx = 0
+    If hCharts(0) <> 0 Then SetFocus(hCharts(0))
+End Sub
+
+' ── WndProc des fenêtres graphe enfant ───────────────────────────────────────
+Function ChartWndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
+    Dim pCD As ChartWinData Ptr = GetChartData(hWnd)
+
+    Select Case uMsg
+
+    Case WM_CREATE
+        pCD = CAllocate(SizeOf(ChartWinData))
+        pCD->hwnd        = hWnd
+        pCD->chartIdx    = 0
+        pCD->Chart.ViewStart = 0
+        pCD->Chart.ViewCount = 60
+        pCD->Chart.IsLoaded  = 0
+        pCD->currentTool = ID_TOOL_SELECT
+        pCD->isDrawing   = 0
+        pCD->crosshairX  = -1
+        pCD->crosshairY  = -1
+        pCD->rightClickedOverlayIdx = -1
+        ReDim pCD->Lines(-1)
+        ReDim pCD->Circles(-1)
+        ReDim pCD->FiboFans(-1)
+        ReDim pCD->GannFans(-1)
+        ReDim pCD->FiboRets(-1)
+        ReDim pCD->GannGrids(-1)
+        ReDim pCD->Pentagrams(-1)
+        ReDim pCD->ParaLinesArr(-1)
+        ReDim pCD->ActivePanels(-1)
+        SetWindowLongPtr(hWnd, GWLP_USERDATA, Cast(LONG_PTR, pCD))
+        Return 0
+
+    Case WM_DESTROY
+        If pCD <> NULL Then
+            DeAllocate(pCD)
+            SetWindowLongPtr(hWnd, GWLP_USERDATA, 0)
+        End If
+        Return 0
+
+    Case WM_ERASEBKGND
+        Return 1
+
+    Case WM_PAINT
+        If pCD = NULL Then Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+        Dim rcC As RECT : GetClientRect(hWnd, @rcC)
+        Dim cw As Integer = rcC.right - rcC.left
+        Dim ch As Integer = rcC.bottom - rcC.top
+        Dim ps As PAINTSTRUCT
+        Dim hDC2 As HDC = BeginPaint(hWnd, @ps)
+        Dim hMemDC  As HDC     = CreateCompatibleDC(hDC2)
+        Dim hBitmap As HBITMAP = CreateCompatibleBitmap(hDC2, cw, ch)
+        Dim hOld    As HBITMAP = SelectObject(hMemDC, hBitmap)
+        RenderChartGDIPlus(hWnd, hMemDC, cw, ch, pCD)
+        BitBlt(hDC2, 0, 0, cw, ch, hMemDC, 0, 0, SRCCOPY)
+        ' Bordure colorée si ce graphe est actif (dessinée sur le DC final)
+        If pCD->chartIdx = activeChartIdx And chartCount > 1 Then
+            Dim hBorderPen As HPEN = CreatePen(PS_SOLID, 3, RGB(0, 120, 215))
+            Dim hOldPen As HPEN = SelectObject(hDC2, hBorderPen)
+            Dim hNullBrush As HBRUSH = GetStockObject(NULL_BRUSH)
+            Dim hOldBrush As HBRUSH = SelectObject(hDC2, hNullBrush)
+            Rectangle(hDC2, 1, 1, cw - 1, ch - 1)
+            SelectObject(hDC2, hOldPen)
+            SelectObject(hDC2, hOldBrush)
+            DeleteObject(hBorderPen)
+        End If
+        SelectObject(hMemDC, hOld)
+        DeleteObject(hBitmap)
+        DeleteDC(hMemDC)
+        EndPaint(hWnd, @ps)
+        Return 0
+
+    Case WM_LBUTTONDOWN
+        ' Activer ce graphe
+        For fi As Integer = 0 To MAX_CHARTS - 1
+            If hCharts(fi) = hWnd Then activeChartIdx = fi : Exit For
+        Next fi
+        SetFocus(hWnd)
+        If pCD->Chart.IsLoaded = 0 Then Return 0
+        ' Propager l'outil courant depuis la toolbar (stocké dans currentTool global)
+        pCD->currentTool = currentTool
+
+        Dim mx As Integer = LoWord(lParam)
+        Dim my As Integer = HiWord(lParam)
+
+        ' ── Recalcul de la géométrie depuis les dimensions courantes ──────────
+        ' (même formules que RenderChartGDIPlus — ne pas dépendre du cache pCD->oriX etc.)
+        Dim rcLB As RECT : GetClientRect(hWnd, @rcLB)
+        Dim cwLB As Integer = rcLB.right  - rcLB.left
+        Dim chLB As Integer = rcLB.bottom - rcLB.top
+
+        Dim pcLB As Long = 0   ' nb de panels séparés
+        Dim i As Integer
+        For i = 0 To pCD->ActiveCount - 1
+            If indRegistry.defs(pCD->ActivePanels(i).defIndex).isPanel = 1 Then pcLB += 1
+        Next
+        Dim rsiAreaH_LB As Integer = pcLB * (RSI_PANEL_H + RSI_PANEL_GAP)
+        Dim mainChartH_LB As Integer = chLB - rsiAreaH_LB - 40 - ZOOM_BAR_H
+
+        ' Echelle Y (nécessite vMin/vMax — utiliser le cache si disponible, sinon recalculer)
+        Dim vMinLB As Double = pCD->vMin
+        Dim vMaxLB As Double = pCD->vMax
+        If vMinLB = 0 And vMaxLB = 0 Then
+            vMinLB = 1e30 : vMaxLB = -1e30
+            Dim lastIdxLB As Integer = pCD->Chart.ViewStart + pCD->Chart.ViewCount - 1
+            If lastIdxLB > UBound(pCD->Chart.History) Then lastIdxLB = UBound(pCD->Chart.History)
+            For i = pCD->Chart.ViewStart To lastIdxLB
+                If pCD->Chart.History(i).L < vMinLB Then vMinLB = pCD->Chart.History(i).L
+                If pCD->Chart.History(i).H > vMaxLB Then vMaxLB = pCD->Chart.History(i).H
+            Next
+            vMinLB *= 0.999 : vMaxLB *= 1.001
+        End If
+
+        Dim oriXlb As Single = 65 + toolbarW
+        Dim oriYlb As Single = mainChartH_LB + ZOOM_BAR_H
+        Dim lenXlb As Single = cwLB - 120 - toolbarW
+        Dim lenYlb As Single = mainChartH_LB - 40
+        Dim scaleYlb As Double = IIf(vMaxLB - vMinLB <> 0, lenYlb / (vMaxLB - vMinLB), 1)
+        Dim stepXlb As Single = IIf(pCD->Chart.ViewCount > 0, lenXlb / pCD->Chart.ViewCount, 1)
+
+        ' ── Sync complète des globales depuis pCD AVANT tout appel helper ────
+        ' QChart doit refléter CE graphe (SnapToCandle, HitTestCanvas l'utilisent)
+        QChart = pCD->Chart
+
+        ' mainChartH_cached utilisé par HitTestCanvas — recalculer proprement
+        mainChartH_cached = mainChartH_LB
+
+        ' Sync globales géométrie (déjà calculées ci-dessus)
+        g_oriX   = oriXlb  : g_oriY   = oriYlb
+        g_stepX  = stepXlb : g_scaleY = scaleYlb
+        g_vMin   = vMinLB  : g_vMax   = vMaxLB
+        g_lenY   = lenYlb
+
+        ' Sync cache pCD pour cohérence avec le prochain rendu
+        pCD->oriX   = oriXlb  : pCD->oriY   = oriYlb
+        pCD->stepX  = stepXlb : pCD->scaleY = scaleYlb
+        pCD->vMin   = vMinLB  : pCD->vMax   = vMaxLB
+        pCD->lenY   = lenYlb
+        pCD->mainChartH_cached = mainChartH_LB
+
+        PanelGeomCount = pCD->PanelGeomCount
+        For i = 0 To pCD->PanelGeomCount - 1
+            PanelGeoms(i) = pCD->PanelGeoms(i)
+        Next
+
+        ' Détection clic ✕ sur panneaux / overlays actifs
+        Dim panelHitIdx As Long = 0
+        Dim globalOvHitIdx As Long = 0
+        Dim panelCnt As Long = 0
+        For i As Integer = 0 To pCD->ActiveCount - 1
+            If indRegistry.defs(pCD->ActivePanels(i).defIndex).isPanel = 1 Then panelCnt += 1
+        Next
+        ' oriX réel : calculé comme dans RenderChartGDIPlus
+        Dim rcHT As RECT : GetClientRect(hWnd, @rcHT)
+        Dim htOriX As Long = 65 + toolbarW   ' même formule que RenderChartGDIPlus
+        Dim htLenX As Single = (rcHT.right - rcHT.left) - 120 - toolbarW
+        Dim htMainH As Long  = (rcHT.bottom - rcHT.top) - panelCnt * (RSI_PANEL_H + RSI_PANEL_GAP) - 40 - ZOOM_BAR_H
+
+        For i As Integer = 0 To pCD->ActiveCount - 1
+            Dim def As IndicatorDef = indRegistry.defs(pCD->ActivePanels(i).defIndex)
+            If def.isPanel = 0 Then
+                ' Overlay : zone hit = label entier + croix, tolérance +4px de chaque côté
+                Dim maLbl As String = def.labelPrefix & "(" & pCD->ActivePanels(i).period & ")"
+                Dim htLblX As Long = htOriX + 4
+                Dim htLblY As Long = ZOOM_BAR_H + 14 + globalOvHitIdx * (RSI_CLOSE_BTN + 4)
+                Dim htZoneW As Long = Len(maLbl) * 7 + 3 + RSI_CLOSE_BTN + 8
+                Dim htZoneH As Long = RSI_CLOSE_BTN + 8
+                If mx >= htLblX And mx <= htLblX + htZoneW And _
+                   my >= htLblY - 4 And my <= htLblY - 4 + htZoneH Then
+                    For j As Integer = i To pCD->ActiveCount - 2 : pCD->ActivePanels(j) = pCD->ActivePanels(j+1) : Next
+                    pCD->ActiveCount -= 1
+                    If pCD->ActiveCount = 0 Then ReDim pCD->ActivePanels(-1) Else ReDim Preserve pCD->ActivePanels(pCD->ActiveCount - 1)
+                    InvalidateRect(hWnd, NULL, FALSE) : Return 0
+                End If
+                globalOvHitIdx += 1
+            Else
+                ' Panel séparé : croix en haut à droite, position exacte comme dans RenderChartGDIPlus
+                Dim htRTop As Long = htMainH + RSI_PANEL_MARGIN + panelHitIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
+                Dim htBxRSI As Single = htOriX + htLenX - RSI_CLOSE_BTN - 2
+                Dim htByRSI As Single = htRTop + 2
+                ' Zone de hit élargie +6px de chaque côté
+                If mx >= htBxRSI - 6 And mx <= htBxRSI + RSI_CLOSE_BTN + 6 And _
+                   my >= htByRSI - 6 And my <= htByRSI + RSI_CLOSE_BTN + 6 Then
+                    For j As Integer = i To pCD->ActiveCount - 2 : pCD->ActivePanels(j) = pCD->ActivePanels(j+1) : Next
+                    pCD->ActiveCount -= 1
+                    If pCD->ActiveCount = 0 Then ReDim pCD->ActivePanels(-1) Else ReDim Preserve pCD->ActivePanels(pCD->ActiveCount - 1)
+                    InvalidateRect(hWnd, NULL, FALSE) : Return 0
+                End If
+                panelHitIdx += 1
+            End If
+        Next
+
+        Select Case pCD->currentTool
+        Case ID_TOOL_LINE
+            Dim clickCanvas As Integer = HitTestCanvas(mx, my)
+            If clickCanvas = -1 Then Return 0
+            If pCD->isDrawing = 0 Then
+                If clickCanvas = 0 Then
+                    SnapToCandle(mx, my)
+                    pCD->tmpBar   = g_snapBar
+                    pCD->tmpPrice = g_snapPrice
+                Else
+                    pCD->tmpBar   = pCD->Chart.ViewStart + CInt((mx - g_oriX) / g_stepX)
+                    pCD->tmpPrice = ScreenYToValue(my, clickCanvas)
+                End If
+                pCD->tmpCanvasType = clickCanvas
+                pCD->isDrawing = 1
+            Else
+                Dim n As Integer = UBound(pCD->Lines) + 1
+                ReDim Preserve pCD->Lines(n)
+                pCD->Lines(n).bar1       = pCD->tmpBar
+                pCD->Lines(n).price1     = pCD->tmpPrice
+                pCD->Lines(n).canvasType = pCD->tmpCanvasType
+                If pCD->tmpCanvasType = 0 Then
+                    SnapToCandle(mx, my)
+                    pCD->Lines(n).bar2   = g_snapBar
+                    pCD->Lines(n).price2 = g_snapPrice
+                Else
+                    pCD->Lines(n).bar2   = pCD->Chart.ViewStart + CInt((mx - g_oriX) / g_stepX)
+                    pCD->Lines(n).price2 = ScreenYToValue(my, pCD->tmpCanvasType)
+                End If
+                pCD->isDrawing = 0
+            End If
+        Case ID_TOOL_CIRCLE
+            SnapToCandle(mx, my)
+            pCD->circleClickNb += 1
+            pCD->circleBar(pCD->circleClickNb)   = g_snapBar
+            pCD->circlePrice(pCD->circleClickNb) = g_snapPrice
+            If pCD->circleClickNb = 3 Then
+                Dim nc As Integer = UBound(pCD->Circles) + 1
+                ReDim Preserve pCD->Circles(nc)
+                pCD->Circles(nc).bar1   = pCD->circleBar(1)   : pCD->Circles(nc).price1 = pCD->circlePrice(1)
+                pCD->Circles(nc).bar2   = pCD->circleBar(2)   : pCD->Circles(nc).price2 = pCD->circlePrice(2)
+                pCD->Circles(nc).bar3   = pCD->circleBar(3)   : pCD->Circles(nc).price3 = pCD->circlePrice(3)
+                pCD->circleClickNb = 0
+            End If
+        Case ID_TOOL_FIBOFAN
+            SnapToCandle(mx, my)
+            pCD->fiboFanClickNb += 1
+            If pCD->fiboFanClickNb = 1 Then
+                pCD->fiboFanBar1   = g_snapBar
+                pCD->fiboFanPrice1 = g_snapPrice
+            Else
+                Dim nff As Integer = UBound(pCD->FiboFans) + 1
+                ReDim Preserve pCD->FiboFans(nff)
+                pCD->FiboFans(nff).bar1   = pCD->fiboFanBar1   : pCD->FiboFans(nff).price1 = pCD->fiboFanPrice1
+                pCD->FiboFans(nff).bar2   = g_snapBar          : pCD->FiboFans(nff).price2 = g_snapPrice
+                pCD->fiboFanClickNb = 0
+            End If
+        Case ID_TOOL_GANNFAN
+            SnapToCandle(mx, my)
+            pCD->gannFanClickNb += 1
+            If pCD->gannFanClickNb = 1 Then
+                pCD->gannFanBar1   = g_snapBar
+                pCD->gannFanPrice1 = g_snapPrice
+            Else
+                Dim ngf As Integer = UBound(pCD->GannFans) + 1
+                ReDim Preserve pCD->GannFans(ngf)
+                pCD->GannFans(ngf).bar1   = pCD->gannFanBar1   : pCD->GannFans(ngf).price1 = pCD->gannFanPrice1
+                pCD->GannFans(ngf).bar2   = g_snapBar          : pCD->GannFans(ngf).price2 = g_snapPrice
+                pCD->gannFanClickNb = 0
+            End If
+        Case ID_TOOL_FIBORET
+            SnapToCandle(mx, my)
+            pCD->fiboRetClickNb += 1
+            If pCD->fiboRetClickNb = 1 Then
+                pCD->fiboRetBar1   = g_snapBar
+                pCD->fiboRetPrice1 = g_snapPrice
+            Else
+                Dim nfr As Integer = UBound(pCD->FiboRets) + 1
+                ReDim Preserve pCD->FiboRets(nfr)
+                pCD->FiboRets(nfr).bar1   = pCD->fiboRetBar1   : pCD->FiboRets(nfr).price1 = pCD->fiboRetPrice1
+                pCD->FiboRets(nfr).bar2   = g_snapBar          : pCD->FiboRets(nfr).price2 = g_snapPrice
+                pCD->fiboRetClickNb = 0
+            End If
+        Case ID_TOOL_GANNGRID
+            SnapToCandle(mx, my)
+            pCD->gannGridClickNb += 1
+            If pCD->gannGridClickNb = 1 Then
+                pCD->gannGridBar1   = g_snapBar
+                pCD->gannGridPrice1 = g_snapPrice
+            Else
+                Dim ngg As Integer = UBound(pCD->GannGrids) + 1
+                ReDim Preserve pCD->GannGrids(ngg)
+                pCD->GannGrids(ngg).bar1   = pCD->gannGridBar1   : pCD->GannGrids(ngg).price1 = pCD->gannGridPrice1
+                pCD->GannGrids(ngg).bar2   = g_snapBar           : pCD->GannGrids(ngg).price2 = g_snapPrice
+                pCD->gannGridClickNb = 0
+            End If
+        Case ID_TOOL_PENTAGRAM
+            SnapToCandle(mx, my)
+            pCD->pentaClickNb += 1
+            If pCD->pentaClickNb = 1 Then
+                pCD->pentaBar1   = g_snapBar
+                pCD->pentaPrice1 = g_snapPrice
+            Else
+                Dim npt As Integer = UBound(pCD->Pentagrams) + 1
+                ReDim Preserve pCD->Pentagrams(npt)
+                pCD->Pentagrams(npt).bar1   = pCD->pentaBar1   : pCD->Pentagrams(npt).price1 = pCD->pentaPrice1
+                pCD->Pentagrams(npt).bar2   = g_snapBar        : pCD->Pentagrams(npt).price2 = g_snapPrice
+                pCD->pentaClickNb = 0
+            End If
+        Case ID_TOOL_PARALINES
+            SnapToCandle(mx, my)
+            pCD->paraClickNb += 1
+            If pCD->paraClickNb = 1 Then
+                pCD->paraBar1   = g_snapBar
+                pCD->paraPrice1 = g_snapPrice
+            ElseIf pCD->paraClickNb = 2 Then
+                pCD->paraBar2   = g_snapBar
+                pCD->paraPrice2 = g_snapPrice
+            Else
+                Dim npl As Integer = UBound(pCD->ParaLinesArr) + 1
+                ReDim Preserve pCD->ParaLinesArr(npl)
+                pCD->ParaLinesArr(npl).bar1   = pCD->paraBar1   : pCD->ParaLinesArr(npl).price1 = pCD->paraPrice1
+                pCD->ParaLinesArr(npl).bar2   = pCD->paraBar2   : pCD->ParaLinesArr(npl).price2 = pCD->paraPrice2
+                pCD->ParaLinesArr(npl).bar3   = g_snapBar       : pCD->ParaLinesArr(npl).price3 = g_snapPrice
+                pCD->paraClickNb = 0
+            End If
+        Case ID_TOOL_ERASER
+            Dim ERASE_R As Single = 15.0   ' rayon de hit en pixels
+
+            ' Helper inline : distance point-point
+            #define EPtDist(ax,ay,bx,by) Sqr(((ax)-(bx))^2+((ay)-(by))^2)
+
+            ' ── Trendlines ───────────────────────────────────────────────────
+            Dim foundE As Integer = -1
+            Dim bestDistE As Single = 1e30
+            Dim eiE As Integer
+            For eiE = 0 To UBound(pCD->Lines)
+                Dim ex1 As Single = g_oriX + (pCD->Lines(eiE).bar1 - pCD->Chart.ViewStart) * g_stepX + (g_stepX/2)
+                Dim ey1 As Single = ValueToScreenY(pCD->Lines(eiE).price1, pCD->Lines(eiE).canvasType)
+                Dim ex2 As Single = g_oriX + (pCD->Lines(eiE).bar2 - pCD->Chart.ViewStart) * g_stepX + (g_stepX/2)
+                Dim ey2 As Single = ValueToScreenY(pCD->Lines(eiE).price2, pCD->Lines(eiE).canvasType)
+                Dim dE As Single = DistToSegment(CSng(mx), CSng(my), ex1, ey1, ex2, ey2)
+                Dim d1E As Single = EPtDist(CSng(mx), CSng(my), ex1, ey1)
+                Dim d2E As Single = EPtDist(CSng(mx), CSng(my), ex2, ey2)
+                If d1E < dE Then dE = d1E
+                If d2E < dE Then dE = d2E
+                If dE < bestDistE Then bestDistE = dE : foundE = eiE
+            Next
+            If foundE > -1 And bestDistE < ERASE_R Then
+                For j As Integer = foundE To UBound(pCD->Lines) - 1 : pCD->Lines(j) = pCD->Lines(j+1) : Next
+                If UBound(pCD->Lines) = 0 Then ReDim pCD->Lines(-1) Else ReDim Preserve pCD->Lines(UBound(pCD->Lines) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── Cercles ──────────────────────────────────────────────────────
+            Dim foundC As Integer = -1
+            Dim bestDistC As Single = 1e30
+            Dim eiC As Integer
+            For eiC = 0 To UBound(pCD->Circles)
+                ' Recalculer centre et rayon du cercle en pixels
+                Dim cpx1 As Single = g_oriX + (pCD->Circles(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim cpy1 As Single = ValueToScreenY(pCD->Circles(eiC).price1, 0)
+                Dim cpx2 As Single = g_oriX + (pCD->Circles(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim cpy2 As Single = ValueToScreenY(pCD->Circles(eiC).price2, 0)
+                Dim cpx3 As Single = g_oriX + (pCD->Circles(eiC).bar3 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim cpy3 As Single = ValueToScreenY(pCD->Circles(eiC).price3, 0)
+                ' Distance aux 3 points de contrôle
+                Dim dc1 As Single = EPtDist(CSng(mx), CSng(my), cpx1, cpy1)
+                Dim dc2 As Single = EPtDist(CSng(mx), CSng(my), cpx2, cpy2)
+                Dim dc3 As Single = EPtDist(CSng(mx), CSng(my), cpx3, cpy3)
+                Dim dcMin As Single = dc1
+                If dc2 < dcMin Then dcMin = dc2
+                If dc3 < dcMin Then dcMin = dc3
+                ' Distance au cercle lui-même (si centre calculable)
+                Dim cxda As Double = cpx2 - cpx1 : Dim cyda As Double = cpy2 - cpy1
+                Dim cxdb As Double = cpx3 - cpx2 : Dim cydb As Double = cpy3 - cpy2
+                If Abs(cxda) > 0.001 And Abs(cxdb) > 0.001 Then
+                    Dim caSlp As Double = cyda / cxda : Dim cbSlp As Double = cydb / cxdb
+                    If Abs(cbSlp - caSlp) > 0.001 Then
+                        Dim ccx As Single = CSng((caSlp*cbSlp*(cpy1-cpy3)+cbSlp*(cpx1+cpx2)-caSlp*(cpx2+cpx3))/(2.0*(cbSlp-caSlp)))
+                        Dim ccy As Single = CSng(-1.0*(ccx-(cpx1+cpx2)/2.0)/caSlp+(cpy1+cpy2)/2.0)
+                        Dim cRad As Single = EPtDist(cpx1, cpy1, ccx, ccy)
+                        Dim dFromCenter As Single = EPtDist(CSng(mx), CSng(my), ccx, ccy)
+                        Dim dCirc As Single = Abs(dFromCenter - cRad)
+                        If dCirc < dcMin Then dcMin = dCirc
+                    End If
+                End If
+                If dcMin < bestDistC Then bestDistC = dcMin : foundC = eiC
+            Next
+            If foundC > -1 And bestDistC < ERASE_R Then
+                For j As Integer = foundC To UBound(pCD->Circles) - 1 : pCD->Circles(j) = pCD->Circles(j+1) : Next
+                If UBound(pCD->Circles) = 0 Then ReDim pCD->Circles(-1) Else ReDim Preserve pCD->Circles(UBound(pCD->Circles) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── FiboFans ─────────────────────────────────────────────────────
+            Dim foundFF As Integer = -1 : Dim bestFF As Single = 1e30
+            For eiC = 0 To UBound(pCD->FiboFans)
+                Dim ffx1 As Single = g_oriX + (pCD->FiboFans(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ffy1 As Single = ValueToScreenY(pCD->FiboFans(eiC).price1, 0)
+                Dim ffx2 As Single = g_oriX + (pCD->FiboFans(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ffy2 As Single = ValueToScreenY(pCD->FiboFans(eiC).price2, 0)
+                Dim dFF As Single = DistToSegment(CSng(mx), CSng(my), ffx1, ffy1, ffx2, ffy2)
+                Dim dFF1 As Single = EPtDist(CSng(mx), CSng(my), ffx1, ffy1)
+                Dim dFF2 As Single = EPtDist(CSng(mx), CSng(my), ffx2, ffy2)
+                If dFF1 < dFF Then dFF = dFF1
+                If dFF2 < dFF Then dFF = dFF2
+                If dFF < bestFF Then bestFF = dFF : foundFF = eiC
+            Next
+            If foundFF > -1 And bestFF < ERASE_R Then
+                For j As Integer = foundFF To UBound(pCD->FiboFans) - 1 : pCD->FiboFans(j) = pCD->FiboFans(j+1) : Next
+                If UBound(pCD->FiboFans) = 0 Then ReDim pCD->FiboFans(-1) Else ReDim Preserve pCD->FiboFans(UBound(pCD->FiboFans) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── GannFans ─────────────────────────────────────────────────────
+            Dim foundGF As Integer = -1 : Dim bestGF As Single = 1e30
+            For eiC = 0 To UBound(pCD->GannFans)
+                Dim gfx1 As Single = g_oriX + (pCD->GannFans(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim gfy1 As Single = ValueToScreenY(pCD->GannFans(eiC).price1, 0)
+                Dim gfx2 As Single = g_oriX + (pCD->GannFans(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim gfy2 As Single = ValueToScreenY(pCD->GannFans(eiC).price2, 0)
+                Dim dGF As Single = DistToSegment(CSng(mx), CSng(my), gfx1, gfy1, gfx2, gfy2)
+                Dim dGF1 As Single = EPtDist(CSng(mx), CSng(my), gfx1, gfy1)
+                If dGF1 < dGF Then dGF = dGF1
+                If dGF < bestGF Then bestGF = dGF : foundGF = eiC
+            Next
+            If foundGF > -1 And bestGF < ERASE_R Then
+                For j As Integer = foundGF To UBound(pCD->GannFans) - 1 : pCD->GannFans(j) = pCD->GannFans(j+1) : Next
+                If UBound(pCD->GannFans) = 0 Then ReDim pCD->GannFans(-1) Else ReDim Preserve pCD->GannFans(UBound(pCD->GannFans) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── FiboRetracements ─────────────────────────────────────────────
+            Dim foundFR As Integer = -1 : Dim bestFR As Single = 1e30
+            For eiC = 0 To UBound(pCD->FiboRets)
+                Dim frx1 As Single = g_oriX + (pCD->FiboRets(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim fry1 As Single = ValueToScreenY(pCD->FiboRets(eiC).price1, 0)
+                Dim frx2 As Single = g_oriX + (pCD->FiboRets(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim fry2 As Single = ValueToScreenY(pCD->FiboRets(eiC).price2, 0)
+                Dim dFR1 As Single = EPtDist(CSng(mx), CSng(my), frx1, fry1)
+                Dim dFR2 As Single = EPtDist(CSng(mx), CSng(my), frx2, fry2)
+                Dim dFR As Single = IIf(dFR1 < dFR2, dFR1, dFR2)
+                If dFR < bestFR Then bestFR = dFR : foundFR = eiC
+            Next
+            If foundFR > -1 And bestFR < ERASE_R Then
+                For j As Integer = foundFR To UBound(pCD->FiboRets) - 1 : pCD->FiboRets(j) = pCD->FiboRets(j+1) : Next
+                If UBound(pCD->FiboRets) = 0 Then ReDim pCD->FiboRets(-1) Else ReDim Preserve pCD->FiboRets(UBound(pCD->FiboRets) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── GannGrids ────────────────────────────────────────────────────
+            Dim foundGG As Integer = -1 : Dim bestGG As Single = 1e30
+            For eiC = 0 To UBound(pCD->GannGrids)
+                Dim ggx1 As Single = g_oriX + (pCD->GannGrids(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ggy1 As Single = ValueToScreenY(pCD->GannGrids(eiC).price1, 0)
+                Dim ggx2 As Single = g_oriX + (pCD->GannGrids(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ggy2 As Single = ValueToScreenY(pCD->GannGrids(eiC).price2, 0)
+                Dim dGG1 As Single = EPtDist(CSng(mx), CSng(my), ggx1, ggy1)
+                Dim dGG2 As Single = EPtDist(CSng(mx), CSng(my), ggx2, ggy2)
+                Dim dGG As Single = IIf(dGG1 < dGG2, dGG1, dGG2)
+                If dGG < bestGG Then bestGG = dGG : foundGG = eiC
+            Next
+            If foundGG > -1 And bestGG < ERASE_R Then
+                For j As Integer = foundGG To UBound(pCD->GannGrids) - 1 : pCD->GannGrids(j) = pCD->GannGrids(j+1) : Next
+                If UBound(pCD->GannGrids) = 0 Then ReDim pCD->GannGrids(-1) Else ReDim Preserve pCD->GannGrids(UBound(pCD->GannGrids) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── Pentagrams ───────────────────────────────────────────────────
+            Dim foundPT As Integer = -1 : Dim bestPT As Single = 1e30
+            For eiC = 0 To UBound(pCD->Pentagrams)
+                Dim ptx1 As Single = g_oriX + (pCD->Pentagrams(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim pty1 As Single = ValueToScreenY(pCD->Pentagrams(eiC).price1, 0)
+                Dim ptx2 As Single = g_oriX + (pCD->Pentagrams(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim pty2 As Single = ValueToScreenY(pCD->Pentagrams(eiC).price2, 0)
+                Dim dPT1 As Single = EPtDist(CSng(mx), CSng(my), ptx1, pty1)
+                Dim dPT2 As Single = EPtDist(CSng(mx), CSng(my), ptx2, pty2)
+                Dim dPT As Single = IIf(dPT1 < dPT2, dPT1, dPT2)
+                If dPT < bestPT Then bestPT = dPT : foundPT = eiC
+            Next
+            If foundPT > -1 And bestPT < ERASE_R Then
+                For j As Integer = foundPT To UBound(pCD->Pentagrams) - 1 : pCD->Pentagrams(j) = pCD->Pentagrams(j+1) : Next
+                If UBound(pCD->Pentagrams) = 0 Then ReDim pCD->Pentagrams(-1) Else ReDim Preserve pCD->Pentagrams(UBound(pCD->Pentagrams) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+
+            ' ── ParaLines ────────────────────────────────────────────────────
+            Dim foundPL As Integer = -1 : Dim bestPL As Single = 1e30
+            For eiC = 0 To UBound(pCD->ParaLinesArr)
+                Dim plx1 As Single = g_oriX + (pCD->ParaLinesArr(eiC).bar1 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ply1 As Single = ValueToScreenY(pCD->ParaLinesArr(eiC).price1, 0)
+                Dim plx2 As Single = g_oriX + (pCD->ParaLinesArr(eiC).bar2 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ply2 As Single = ValueToScreenY(pCD->ParaLinesArr(eiC).price2, 0)
+                Dim plx3 As Single = g_oriX + (pCD->ParaLinesArr(eiC).bar3 - pCD->Chart.ViewStart) * g_stepX + g_stepX*0.5
+                Dim ply3 As Single = ValueToScreenY(pCD->ParaLinesArr(eiC).price3, 0)
+                Dim dPL1 As Single = EPtDist(CSng(mx), CSng(my), plx1, ply1)
+                Dim dPL2 As Single = EPtDist(CSng(mx), CSng(my), plx2, ply2)
+                Dim dPL3 As Single = EPtDist(CSng(mx), CSng(my), plx3, ply3)
+                Dim dPL As Single = dPL1
+                If dPL2 < dPL Then dPL = dPL2
+                If dPL3 < dPL Then dPL = dPL3
+                If dPL < bestPL Then bestPL = dPL : foundPL = eiC
+            Next
+            If foundPL > -1 And bestPL < ERASE_R Then
+                For j As Integer = foundPL To UBound(pCD->ParaLinesArr) - 1 : pCD->ParaLinesArr(j) = pCD->ParaLinesArr(j+1) : Next
+                If UBound(pCD->ParaLinesArr) = 0 Then ReDim pCD->ParaLinesArr(-1) Else ReDim Preserve pCD->ParaLinesArr(UBound(pCD->ParaLinesArr) - 1)
+                InvalidateRect(hWnd, NULL, FALSE) : Return 0
+            End If
+        End Select
+        InvalidateRect(hWnd, NULL, FALSE)
+        Return 0
+
+    Case WM_MOUSEMOVE
+        If pCD = NULL Then Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+        pCD->currentTool = currentTool
+        If pCD->currentTool = ID_TOOL_CROSSHAIR And pCD->Chart.IsLoaded Then
+            pCD->crosshairX = LoWord(lParam) : pCD->crosshairY = HiWord(lParam)
+            SetCursor(LoadCursor(NULL, IDC_CROSS))
+            InvalidateRect(hWnd, NULL, FALSE)
+        ElseIf pCD->Chart.IsLoaded And ( _
+            (pCD->currentTool = ID_TOOL_LINE     And pCD->isDrawing = 1) Or _
+            (pCD->currentTool = ID_TOOL_FIBOFAN  And pCD->fiboFanClickNb  = 1) Or _
+            (pCD->currentTool = ID_TOOL_GANNFAN  And pCD->gannFanClickNb  = 1) Or _
+            (pCD->currentTool = ID_TOOL_FIBORET  And pCD->fiboRetClickNb  = 1) Or _
+            (pCD->currentTool = ID_TOOL_GANNGRID And pCD->gannGridClickNb = 1) Or _
+            (pCD->currentTool = ID_TOOL_PENTAGRAM And pCD->pentaClickNb   = 1) Or _
+            (pCD->currentTool = ID_TOOL_CIRCLE   And pCD->circleClickNb  >= 1) Or _
+            (pCD->currentTool = ID_TOOL_PARALINES And pCD->paraClickNb   >= 1)) Then
+            InvalidateRect(hWnd, NULL, FALSE)
+        End If
+        Return 0
+
+    Case WM_RBUTTONDOWN
+        If pCD = NULL Then Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+        pCD->currentTool = currentTool
+        If pCD->isDrawing     Then pCD->isDrawing     = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->circleClickNb  > 0 Then pCD->circleClickNb  = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->fiboFanClickNb > 0 Then pCD->fiboFanClickNb = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->gannFanClickNb > 0 Then pCD->gannFanClickNb = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->fiboRetClickNb > 0 Then pCD->fiboRetClickNb = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->gannGridClickNb > 0 Then pCD->gannGridClickNb = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->pentaClickNb   > 0 Then pCD->pentaClickNb   = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+        If pCD->paraClickNb    > 0 Then pCD->paraClickNb    = 0 : InvalidateRect(hWnd, NULL, FALSE) : Return 0
+
+        ' Sync globales pour HitTestOverlayLabel/HitTestPanelArea
+        ' Recalcul depuis dimensions courantes (même logique que WM_LBUTTONDOWN)
+        Dim rcRB As RECT : GetClientRect(hWnd, @rcRB)
+        Dim cwRB As Integer = rcRB.right - rcRB.left
+        Dim chRB As Integer = rcRB.bottom - rcRB.top
+        Dim pcRB As Long = 0
+        Dim iiRB As Integer
+        For iiRB = 0 To pCD->ActiveCount - 1
+            If indRegistry.defs(pCD->ActivePanels(iiRB).defIndex).isPanel = 1 Then pcRB += 1
+        Next
+        Dim mainHrb As Integer = chRB - pcRB * (RSI_PANEL_H + RSI_PANEL_GAP) - 40 - ZOOM_BAR_H
+        Dim vMinRB As Double = pCD->vMin : Dim vMaxRB As Double = pCD->vMax
+        If vMinRB = 0 And vMaxRB = 0 Then vMinRB = 1.0 : vMaxRB = 2.0
+        Dim oriXrb As Single = 65 + toolbarW
+        Dim oriYrb As Single = mainHrb + ZOOM_BAR_H
+        Dim lenXrb As Single = cwRB - 120 - toolbarW
+        Dim lenYrb As Single = mainHrb - 40
+        Dim scaleYrb As Double = IIf(vMaxRB - vMinRB <> 0, lenYrb / (vMaxRB - vMinRB), 1)
+        Dim stepXrb As Single = IIf(pCD->Chart.ViewCount > 0, lenXrb / pCD->Chart.ViewCount, 1)
+        g_oriX = oriXrb : g_oriY = oriYrb : g_stepX = stepXrb
+        g_scaleY = scaleYrb : g_vMin = vMinRB : g_vMax = vMaxRB : g_lenY = lenYrb
+        ' Sync QChart et mainChartH_cached pour HitTestCanvas et helpers
+        QChart = pCD->Chart
+        mainChartH_cached = mainHrb
+        PanelGeomCount = pCD->PanelGeomCount
+        Dim rmxi As Integer
+        For rmxi = 0 To pCD->PanelGeomCount - 1 : PanelGeoms(rmxi) = pCD->PanelGeoms(rmxi) : Next
+        ActiveCount = pCD->ActiveCount
+        If pCD->ActiveCount > 0 Then ReDim ActivePanels(pCD->ActiveCount - 1)
+        For rmxi = 0 To pCD->ActiveCount - 1 : ActivePanels(rmxi) = pCD->ActivePanels(rmxi) : Next
+
+        Dim rmx As Integer = LoWord(lParam)
+        Dim rmy As Integer = HiWord(lParam)
+
+        ' ── Tester d'abord si clic sur un indicator label/panel ──────────────
+        Dim hitInd As Integer = HitTestOverlayLabel(rmx, rmy)
+        If hitInd < 0 Then hitInd = HitTestPanelArea(rmx, rmy)
+
+        ' ── Construire le menu contextuel ────────────────────────────────────
+        Dim hPop As HMENU = CreatePopupMenu()
+
+        ' Toujours présent : charger un CSV dans ce graphe
+        Dim zLoad As ZString * 32 = "Charger CSV..."
+        AppendMenu(hPop, MF_STRING, ID_CHART_LOADCSV, @zLoad)
+
+        ' Toujours présent : ouvrir la fenêtre indicateurs pour ce graphe
+        Dim zTech As ZString * 32 = "Indicateurs techniques..."
+        AppendMenu(hPop, MF_STRING, ID_CHART_TECHNICALS, @zTech)
+
+        ' Séparateur + option indicateur si clic sur un label
+        If hitInd >= 0 Then
+            AppendMenu(hPop, MF_SEPARATOR, 0, NULL)
+            pCD->rightClickedOverlayIdx = hitInd : rightClickedOverlayIdx = hitInd
+            Dim defR As IndicatorDef = indRegistry.defs(pCD->ActivePanels(hitInd).defIndex)
+            Dim mLbl As String = "Parametres " & defR.labelPrefix & "(" & pCD->ActivePanels(hitInd).period & ")..."
+            Dim zmLbl As ZString * 64 : zmLbl = mLbl
+            AppendMenu(hPop, MF_STRING, ID_POPUP_PARAMS, @zmLbl)
+        End If
+
+        Dim pt2 As POINT : pt2.x = rmx : pt2.y = rmy
+        ClientToScreen(hWnd, @pt2)
+        Dim cmdR As Integer = TrackPopupMenu(hPop, TPM_LEFTALIGN Or TPM_RIGHTBUTTON Or TPM_RETURNCMD, pt2.x, pt2.y, 0, hWnd, NULL)
+        DestroyMenu(hPop)
+
+        If cmdR = ID_CHART_LOADCSV Then
+            Dim fR As String = File_GetName(GetParent(hWnd))
+            If fR <> "" Then LoadCSVToChart(fR, pCD, GetParent(hWnd))
+        ElseIf cmdR = ID_CHART_TECHNICALS Then
+            OpenTechnicalsForChart(GetParent(hWnd), pCD->chartIdx)
+        ElseIf cmdR = ID_POPUP_PARAMS And hitInd >= 0 Then
+            PostMessage(GetParent(hWnd), WM_COMMAND, ID_POPUP_PARAMS, 0)
+        End If
+        Return 0
+
+    Case WM_MOUSEWHEEL
+        If pCD = NULL Or pCD->Chart.IsLoaded = 0 Then Return 0
+        Dim deltaMW As Short = HiWord(wParam)
+        Dim cpMW As Integer = pCD->Chart.ViewStart
+        If deltaMW < 0 Then cpMW += 5 Else cpMW -= 5
+        Dim msMW As Integer = (UBound(pCD->Chart.History) + 1) - pCD->Chart.ViewCount
+        If cpMW < 0 Then cpMW = 0
+        If cpMW > msMW Then cpMW = msMW
+        pCD->Chart.ViewStart = cpMW
+        If pCD->chartIdx = activeChartIdx Then SetScrollPos(hScroll, SB_CTL, cpMW, TRUE)
+        InvalidateRect(hWnd, NULL, FALSE)
+        Return 0
+
+    Case WM_SETFOCUS
+        For fi As Integer = 0 To MAX_CHARTS - 1
+            If hCharts(fi) = hWnd Then activeChartIdx = fi : Exit For
+        Next fi
+        ' Sync scrollbar avec les données propres à ce graphe
+        If pCD <> NULL And pCD->Chart.IsLoaded Then
+            Dim msSF As Integer = (UBound(pCD->Chart.History) + 1) - pCD->Chart.ViewCount
+            If msSF < 0 Then msSF = 0
+            SetScrollRange(hScroll, SB_CTL, 0, msSF, TRUE)
+            SetScrollPos(hScroll, SB_CTL, pCD->Chart.ViewStart, TRUE)
+            QChart = pCD->Chart
+        Else
+            SetScrollRange(hScroll, SB_CTL, 0, 0, TRUE)
+            SetScrollPos(hScroll, SB_CTL, 0, TRUE)
+        End If
+        ' Redessiner tous les graphes pour mettre à jour la bordure active/inactive
+        Dim rfi As Integer
+        For rfi = 0 To MAX_CHARTS - 1
+            If hCharts(rfi) <> 0 Then InvalidateRect(hCharts(rfi), NULL, FALSE)
+        Next rfi
+        Return 0
+
+    Case WM_KILLFOCUS
+        ' Redessiner pour effacer la bordure active
+        InvalidateRect(hWnd, NULL, FALSE)
+        Return 0
+
+    End Select
+    Return DefWindowProc(hWnd, uMsg, wParam, lParam)
+End Function
+
 Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
     Select Case uMsg
         Case WM_CREATE
-            hWndMain = hWnd   ' stocker pour SetTimer depuis DataSourceProc
-            LoadIniFile()     ' charger les clés API depuis QChartist2.ini
-            Dim hM As HMENU = CreateMenu(), hF As HMENU = CreatePopupMenu()
+            hWndMain = hWnd
+            LoadIniFile()
+            ' ── Enregistrer la classe des fenêtres graphe enfant ─────────────
+            Dim wcChart As WNDCLASSEX
+            wcChart.cbSize        = SizeOf(WNDCLASSEX)
+            wcChart.style         = CS_HREDRAW Or CS_VREDRAW
+            wcChart.lpfnWndProc   = @ChartWndProc
+            wcChart.hInstance     = GetModuleHandle(NULL)
+            wcChart.hCursor       = LoadCursor(NULL, IDC_ARROW)
+            wcChart.hbrBackground = NULL
+            Dim chartClassName As String = "QChartWnd"
+            wcChart.lpszClassName = StrPtr(chartClassName)
+            RegisterClassEx(@wcChart)
+
+            Dim hM As HMENU = CreateMenu()
+            Dim hF As HMENU = CreatePopupMenu()
             AppendMenu(hF, MF_STRING, ID_MENU_OPEN,       "&Open CSV")
             AppendMenu(hF, MF_STRING, ID_MENU_DATASOURCE, "&Data Source...")
-            AppendMenu(hM, MF_POPUP, Cast(UINT_PTR, hF), "&File") : SetMenu(hWnd, hM)
+            AppendMenu(hM, MF_POPUP, Cast(UINT_PTR, hF), "&File")
+            ' ── Menu View (layout multi-graphe) ──────────────────────────────
+            Dim hV As HMENU = CreatePopupMenu()
+            AppendMenu(hV, MF_STRING Or MF_CHECKED, ID_MENU_VIEW1, "1 graphe")
+            AppendMenu(hV, MF_STRING, ID_MENU_VIEW2, "2 graphes")
+            AppendMenu(hV, MF_STRING, ID_MENU_VIEW4, "4 graphes")
+            AppendMenu(hM, MF_POPUP, Cast(UINT_PTR, hV), "&Vue")
+            SetMenu(hWnd, hM)
             hToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, _
                 WS_CHILD Or WS_VISIBLE Or CCS_VERT Or CCS_NORESIZE Or TBSTYLE_FLAT Or TBSTYLE_WRAPABLE, _
                 0, 0, toolbarW, 0, hWnd, NULL, GetModuleHandle(NULL), NULL)
@@ -2342,6 +3220,9 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
             ReDim Lines(-1) : ReDim ActivePanels(-1)
             ' Enregistrer tous les indicateurs du dossier indicators/
             RegisterAllIndicators(@indRegistry)
+            ' ── Créer le premier graphe (layout 1 fenêtre par défaut) ────────
+            chartCount = 1
+            SetChartCount(hWnd, 1)
             Return 0
 
         Case WM_COMMAND
@@ -2352,15 +3233,42 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
                 OpenDataSourceWindow(hWnd)
             ElseIf id = ID_DS_GETCHART Then
                 TiingoGetChart(hWnd)
+            ElseIf id = ID_MENU_VIEW1 Or id = ID_MENU_VIEW2 Or id = ID_MENU_VIEW4 Then
+                ' Mettre à jour les checkmarks du menu Vue
+                Dim hMenuBar As HMENU = GetMenu(hWnd)
+                Dim hViewMenu As HMENU = GetSubMenu(hMenuBar, 1)   ' index 1 = Vue
+                CheckMenuItem(hViewMenu, ID_MENU_VIEW1, IIf(id = ID_MENU_VIEW1, MF_CHECKED, MF_UNCHECKED))
+                CheckMenuItem(hViewMenu, ID_MENU_VIEW2, IIf(id = ID_MENU_VIEW2, MF_CHECKED, MF_UNCHECKED))
+                CheckMenuItem(hViewMenu, ID_MENU_VIEW4, IIf(id = ID_MENU_VIEW4, MF_CHECKED, MF_UNCHECKED))
+                Dim newN As Integer = 1
+                If id = ID_MENU_VIEW2 Then newN = 2
+                If id = ID_MENU_VIEW4 Then newN = 4
+                SetChartCount(hWnd, newN)
             ElseIf id >= ID_TOOL_SELECT And id <= ID_TOOL_PARALINES Then
-                currentTool = id : isDrawing = 0 : circleClickNb = 0 : fiboFanClickNb = 0 : gannFanClickNb = 0 : fiboRetClickNb = 0 : gannGridClickNb = 0 : pentaClickNb = 0 : paraClickNb = 0
-                ' Réinitialiser le crosshair quand on change d'outil
-                If id <> ID_TOOL_CROSSHAIR Then
-                    crosshairX = -1 : crosshairY = -1
-                End If
+                currentTool = id : isDrawing = 0
+                ' Propager l'outil à tous les graphes
+                Dim ci2 As Integer
+                For ci2 = 0 To chartCount - 1
+                    Dim pCDi As ChartWinData Ptr = GetChartData(hCharts(ci2))
+                    If pCDi <> NULL Then
+                        pCDi->currentTool    = id
+                        pCDi->isDrawing      = 0
+                        pCDi->circleClickNb  = 0
+                        pCDi->fiboFanClickNb = 0
+                        pCDi->gannFanClickNb = 0
+                        pCDi->fiboRetClickNb = 0
+                        pCDi->gannGridClickNb = 0
+                        pCDi->pentaClickNb   = 0
+                        pCDi->paraClickNb    = 0
+                        If id <> ID_TOOL_CROSSHAIR Then
+                            pCDi->crosshairX = -1 : pCDi->crosshairY = -1
+                        End If
+                    End If
+                Next
             ElseIf id = ID_BTN_INDICATORS Then
-                Dim wc As WNDCLASS : wc.lpfnWndProc = @IndicatorsDlgProc : wc.hInstance = GetModuleHandle(NULL) : wc.hCursor = LoadCursor(NULL, IDC_ARROW) : wc.hbrBackground = GetStockObject(WHITE_BRUSH) : wc.lpszClassName = StrPtr("IndWin")
-                RegisterClass(@wc) : CreateWindowEx(0, "IndWin", "Technicals", WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 240, 280, hWnd, NULL, GetModuleHandle(NULL), NULL)
+                Dim tgtChart As Integer = activeChartIdx
+                If hCharts(tgtChart) = 0 Then tgtChart = 0
+                OpenTechnicalsForChart(hWnd, tgtChart)
 
             ElseIf id = ID_POPUP_PARAMS Then
                 ' Ouvrir le dialogue de modification de période pour l'overlay cliqué
@@ -2382,31 +3290,25 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
                 End If
 
             ElseIf id = ID_BTN_ZOOM_IN Or id = ID_BTN_ZOOM_OUT Then
-                If QChart.IsLoaded = 0 Then Return 0
-                Dim totalH As Integer = UBound(QChart.History) + 1
-                ' Centre visible actuel (en index de barre)
-                Dim centerBar As Integer = QChart.ViewStart + QChart.ViewCount \ 2
-                ' Nouveau ViewCount
-                Dim newCount As Integer = QChart.ViewCount
-                If id = ID_BTN_ZOOM_IN Then
-                    newCount = newCount - ZOOM_STEP
-                Else
-                    newCount = newCount + ZOOM_STEP
-                End If
-                If newCount < ZOOM_MIN_BARS Then newCount = ZOOM_MIN_BARS
-                If newCount > ZOOM_MAX_BARS Then newCount = ZOOM_MAX_BARS
-                If newCount > totalH Then newCount = totalH
-                QChart.ViewCount = newCount
-                ' Recentrer sur la même barre
-                Dim newStart As Integer = centerBar - newCount \ 2
-                If newStart < 0 Then newStart = 0
-                Dim maxStart As Integer = totalH - newCount
-                If maxStart < 0 Then maxStart = 0
-                If newStart > maxStart Then newStart = maxStart
-                QChart.ViewStart = newStart
-                SetScrollRange(hScroll, SB_CTL, 0, maxStart, TRUE)
-                SetScrollPos(hScroll, SB_CTL, newStart, TRUE)
-                ForceRedraw(hWnd)
+                Dim pCDZ As ChartWinData Ptr = GetChartData(hCharts(activeChartIdx))
+                If pCDZ = NULL Or pCDZ->Chart.IsLoaded = 0 Then Return 0
+                Dim totalHZ As Integer = UBound(pCDZ->Chart.History) + 1
+                Dim centerBarZ As Integer = pCDZ->Chart.ViewStart + pCDZ->Chart.ViewCount \ 2
+                Dim newCountZ As Integer = pCDZ->Chart.ViewCount
+                If id = ID_BTN_ZOOM_IN Then newCountZ -= ZOOM_STEP Else newCountZ += ZOOM_STEP
+                If newCountZ < ZOOM_MIN_BARS Then newCountZ = ZOOM_MIN_BARS
+                If newCountZ > ZOOM_MAX_BARS Then newCountZ = ZOOM_MAX_BARS
+                If newCountZ > totalHZ Then newCountZ = totalHZ
+                pCDZ->Chart.ViewCount = newCountZ
+                Dim newStartZ As Integer = centerBarZ - newCountZ \ 2
+                If newStartZ < 0 Then newStartZ = 0
+                Dim maxStartZ As Integer = totalHZ - newCountZ
+                If maxStartZ < 0 Then maxStartZ = 0
+                If newStartZ > maxStartZ Then newStartZ = maxStartZ
+                pCDZ->Chart.ViewStart = newStartZ
+                SetScrollRange(hScroll, SB_CTL, 0, maxStartZ, TRUE)
+                SetScrollPos(hScroll, SB_CTL, newStartZ, TRUE)
+                InvalidateRect(hCharts(activeChartIdx), NULL, FALSE)
             End If
 
         Case WM_MOUSEMOVE
@@ -2447,22 +3349,21 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
                 If indRegistry.defs(ActivePanels(i).defIndex).isPanel = 1 Then panelCount2 += 1
             Next
             Dim panelHitIdx As Long = 0
-            Dim globalOverlayHitIdx As Long = 0   ' miroir de globalOverlayIdx du rendu
+            Dim globalOverlayHitIdx As Long = 0
+            Dim htOriX2 As Long = 65 + toolbarW
+            Dim htLenX2 As Single = winW - 120 - toolbarW
+            Dim htMainH2 As Long = (winH - SCROLL_H) - panelCount2 * (RSI_PANEL_H + RSI_PANEL_GAP) - 40 - ZOOM_BAR_H
             For i As Integer = 0 To ActiveCount - 1
                 Dim defIdx As Long = ActivePanels(i).defIndex
                 Dim def As IndicatorDef = indRegistry.defs(defIdx)
                 If def.isPanel = 0 Then
-                    ' Overlay : bouton X — position Y identique à celle du rendu
-                    Dim rsiAreaH2 As Long = panelCount2 * (RSI_PANEL_H + RSI_PANEL_GAP)
-                    Dim lenX2 As Single = winW - 120 - toolbarW
-                    Dim maPer2 As Long = ActivePanels(i).period
-                    Dim maLbl2 As String = def.labelPrefix & "(" & maPer2 & ")"
-                    Dim lblX2 As Long = g_oriX + 4
-                    Dim lblY2 As Long = ZOOM_BAR_H + 14 + globalOverlayHitIdx * (RSI_CLOSE_BTN + 4)
-                    Dim bxMA As Single = lblX2 + Len(maLbl2) * 7 + 3
-                    Dim byMA As Single = lblY2 - 1
-                    If mx >= bxMA And mx <= bxMA + RSI_CLOSE_BTN And _
-                       my >= byMA And my <= byMA + RSI_CLOSE_BTN Then
+                    Dim maLbl2 As String = def.labelPrefix & "(" & ActivePanels(i).period & ")"
+                    Dim htLblX2 As Long = htOriX2 + 4
+                    Dim htLblY2 As Long = ZOOM_BAR_H + 14 + globalOverlayHitIdx * (RSI_CLOSE_BTN + 4)
+                    Dim htZoneW2 As Long = Len(maLbl2) * 7 + 3 + RSI_CLOSE_BTN + 8
+                    Dim htZoneH2 As Long = RSI_CLOSE_BTN + 8
+                    If mx >= htLblX2 And mx <= htLblX2 + htZoneW2 And _
+                       my >= htLblY2 - 4 And my <= htLblY2 - 4 + htZoneH2 Then
                         For j As Integer = i To ActiveCount - 2
                             ActivePanels(j) = ActivePanels(j + 1)
                         Next
@@ -2472,15 +3373,11 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
                     End If
                     globalOverlayHitIdx += 1
                 Else
-                    ' Panel séparé : bouton X coin supérieur droit
-                    Dim rsiAreaH3 As Long = panelCount2 * (RSI_PANEL_H + RSI_PANEL_GAP)
-                    Dim mainH3 As Long = (winH - SCROLL_H) - rsiAreaH3 - 40 - ZOOM_BAR_H
-                    Dim lenX3 As Single = winW - 120 - toolbarW
-                    Dim rTop3 As Long = mainH3 + RSI_PANEL_MARGIN + panelHitIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
-                    Dim bxRSI As Single = g_oriX + lenX3 - RSI_CLOSE_BTN - 2
-                    Dim byRSI As Single = rTop3 + 2
-                    If mx >= bxRSI And mx <= bxRSI + RSI_CLOSE_BTN And _
-                       my >= byRSI And my <= byRSI + RSI_CLOSE_BTN Then
+                    Dim htRTop2 As Long = htMainH2 + RSI_PANEL_MARGIN + panelHitIdx * (RSI_PANEL_H + RSI_PANEL_GAP)
+                    Dim htBxRSI2 As Single = htOriX2 + htLenX2 - RSI_CLOSE_BTN - 2
+                    Dim htByRSI2 As Single = htRTop2 + 2
+                    If mx >= htBxRSI2 - 6 And mx <= htBxRSI2 + RSI_CLOSE_BTN + 6 And _
+                       my >= htByRSI2 - 6 And my <= htByRSI2 + RSI_CLOSE_BTN + 6 Then
                         For j As Integer = i To ActiveCount - 2
                             ActivePanels(j) = ActivePanels(j + 1)
                         Next
@@ -2869,20 +3766,15 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
             End If
 
         Case WM_MOUSEWHEEL
-            If QChart.IsLoaded = 0 Then Return 0
-            Dim delta As Short = HiWord(wParam)
-            Dim cp As Integer = QChart.ViewStart
-            If delta < 0 Then cp += 5 Else cp -= 5
-            Dim ms As Integer = (UBound(QChart.History) + 1) - QChart.ViewCount
-            If cp < 0 Then cp = 0
-            If cp > ms Then cp = ms
-            QChart.ViewStart = cp
-            SetScrollPos(hScroll, SB_CTL, cp, TRUE)
-            ForceRedraw(hWnd)
+            ' Rediriger vers le graphe actif (le WM_MOUSEWHEEL peut arriver au parent)
+            If hCharts(activeChartIdx) <> 0 Then
+                SendMessage(hCharts(activeChartIdx), WM_MOUSEWHEEL, wParam, lParam)
+            End If
             Return 0
 
         Case WM_HSCROLL
-            If QChart.IsLoaded = 0 Then Exit Select
+            Dim pCDSc As ChartWinData Ptr = GetChartData(hCharts(activeChartIdx))
+            If pCDSc = NULL Or pCDSc->Chart.IsLoaded = 0 Then Exit Select
             Dim si As SCROLLINFO : si.cbSize = SizeOf(SCROLLINFO) : si.fMask = SIF_ALL : GetScrollInfo(hScroll, SB_CTL, @si)
             Dim cp As Integer = si.nPos
             Select Case Loword(wParam)
@@ -2890,9 +3782,10 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
                 Case SB_LINELEFT : cp -= 1
                 Case SB_LINERIGHT : cp += 1
             End Select
-            Dim ms As Integer = (UBound(QChart.History) + 1) - QChart.ViewCount
+            Dim ms As Integer = (UBound(pCDSc->Chart.History) + 1) - pCDSc->Chart.ViewCount
             If cp < 0 Then cp = 0 : If cp > ms Then cp = ms
-            QChart.ViewStart = cp : SetScrollPos(hScroll, SB_CTL, cp, TRUE) : ForceRedraw(hWnd)
+            pCDSc->Chart.ViewStart = cp : SetScrollPos(hScroll, SB_CTL, cp, TRUE)
+            InvalidateRect(hCharts(activeChartIdx), NULL, FALSE)
 
         Case WM_TIMER
             If wParam = ID_DS_TIMER And dsTimerActive = 1 Then
@@ -2901,31 +3794,23 @@ Function WndProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM)
 
         Case WM_SIZE
             winW = Loword(lParam) : winH = Hiword(lParam)
-            ' Récupère la largeur réelle que la toolbar veut occuper
             Dim tbSize As SIZE
             SendMessage(hToolbar, TB_GETMAXSIZE, 0, Cast(LPARAM, @tbSize))
             If tbSize.cx > 0 Then toolbarW = tbSize.cx
             MoveWindow(hToolbar, 0, 0, toolbarW, winH - 80, TRUE)
             MoveWindow(hBtnIndicators, 0, winH - 75, toolbarW, 30, TRUE)
-            ' Barre de zoom : commence au bord droit de la toolbar verticale, hauteur fixe
             MoveWindow(hZoomBar, toolbarW, 0, winW - toolbarW, ZOOM_BAR_H, TRUE)
             MoveWindow(hScroll, toolbarW + 65, winH - SCROLL_H, winW - 130 - toolbarW, 20, TRUE)
-            ForceRedraw(hWnd)
+            ArrangeChartWindows(hWnd)
 
         Case WM_ERASEBKGND
             Return 1
 
         Case WM_PAINT
+            ' Les graphes enfants gèrent leur propre WM_PAINT.
+            ' On peint uniquement le fond de la zone de la toolbar.
             Dim ps As PAINTSTRUCT
-            Dim hDC As HDC = BeginPaint(hWnd, @ps)
-            Dim hMemDC  As HDC     = CreateCompatibleDC(hDC)
-            Dim hBitmap As HBITMAP = CreateCompatibleBitmap(hDC, winW, winH - SCROLL_H)
-            Dim hOld    As HBITMAP = SelectObject(hMemDC, hBitmap)
-            RenderChartGDIPlus(hWnd, hMemDC, winW, winH - SCROLL_H)
-            BitBlt(hDC, 0, 0, winW, winH - SCROLL_H, hMemDC, 0, 0, SRCCOPY)
-            SelectObject(hMemDC, hOld)
-            DeleteObject(hBitmap)
-            DeleteDC(hMemDC)
+            Dim hDCp As HDC = BeginPaint(hWnd, @ps)
             EndPaint(hWnd, @ps)
             Return 0
 
