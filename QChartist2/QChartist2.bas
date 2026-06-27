@@ -2213,53 +2213,134 @@ Sub RenderChartGDIPlus(hWnd As HWND, hDC As HDC, w As Integer, h As Integer, pCD
 End Sub
 
 ' ── Dialogue "Paramètres" — modification de période d'un overlay ──────────────
+' ════════════════════════════════════════════════════════════════════
+' REMPLACEMENT DE ParamsDlgProc dans QChartist2.bas
+'
+' Chercher et remplacer toute la fonction ParamsDlgProc
+' (de "Function ParamsDlgProc" jusqu'au "End Function" correspondant)
+' par ce code.
+'
+' Changements :
+'   - Ajout d'un label + editbox pour param2 (caché si param2Label="")
+'   - La fenêtre s'agrandit automatiquement si param2 est visible
+'   - OK / Entrée sauvegarde les deux valeurs
+'   - Propagation de param2 au graphe actif comme pour period
+' ════════════════════════════════════════════════════════════════════
+
 Function ParamsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As LPARAM) As LRESULT
-    Static hLbl  As HWND
-    Static hEdit As HWND
-    Static hOK   As HWND
+    Static hLbl   As HWND   ' label "Nouvelle periode :"
+    Static hEdit  As HWND   ' editbox periode
+    Static hLbl2  As HWND   ' label param2
+    Static hEdit2 As HWND   ' editbox param2
+    Static hOK    As HWND   ' bouton OK
 
     Select Case uMsg
+
         Case WM_CREATE
-            ' Label
+            ' ── Champ periode ────────────────────────────────────────
             hLbl = CreateWindowEx(0, "STATIC", "Nouvelle periode :", _
                 WS_CHILD Or WS_VISIBLE, _
                 10, 14, 120, 20, hWnd, NULL, GetModuleHandle(NULL), NULL)
-            ' EditBox numérique pré-rempli avec la période actuelle
             hEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", _
                 WS_CHILD Or WS_VISIBLE Or ES_NUMBER, _
                 135, 12, 60, 22, hWnd, Cast(HMENU, ID_EDT_PERIOD), _
                 GetModuleHandle(NULL), NULL)
             SendMessage(hEdit, EM_SETLIMITTEXT, 4, 0)
-            If rightClickedOverlayIdx >= 0 And rightClickedOverlayIdx < ActiveCount Then
-                Dim curPer As ZString * 8
-                curPer = Str(ActivePanels(rightClickedOverlayIdx).period)
-                SetWindowText(hEdit, @curPer)
-                SendMessage(hEdit, EM_SETSEL, 0, -1)   ' sélectionner tout
-            End If
-            ' Bouton OK
+
+            ' ── Champ param2 (créé mais caché par défaut) ────────────
+            hLbl2 = CreateWindowEx(0, "STATIC", "", _
+                WS_CHILD, _
+                10, 44, 120, 20, hWnd, Cast(HMENU, ID_LBL_PERIOD2), _
+                GetModuleHandle(NULL), NULL)
+            hEdit2 = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", _
+                WS_CHILD Or ES_NUMBER, _
+                135, 42, 60, 22, hWnd, Cast(HMENU, ID_EDT_PERIOD2), _
+                GetModuleHandle(NULL), NULL)
+            SendMessage(hEdit2, EM_SETLIMITTEXT, 5, 0)
+
+            ' ── Bouton OK (position ajustée dynamiquement après) ─────
             hOK = CreateWindowEx(0, "BUTTON", "OK", _
                 WS_CHILD Or WS_VISIBLE Or BS_DEFPUSHBUTTON, _
                 75, 46, 70, 26, hWnd, Cast(HMENU, IDOK), _
                 GetModuleHandle(NULL), NULL)
+
+            ' ── Remplissage des valeurs courantes ────────────────────
+            If rightClickedOverlayIdx >= 0 And rightClickedOverlayIdx < ActiveCount Then
+                Dim ap As ActivePanel = ActivePanels(rightClickedOverlayIdx)
+                Dim def As IndicatorDef = indRegistry.defs(ap.defIndex)
+
+                ' Periode
+                Dim curPer As ZString * 8 : curPer = Str(ap.period)
+                SetWindowText(hEdit, @curPer)
+                SendMessage(hEdit, EM_SETSEL, 0, -1)
+
+                ' param2 : afficher seulement si param2Label non vide
+                Dim p2lbl As String = Trim(def.param2Label)
+                If Len(p2lbl) > 0 Then
+                    ' Mettre à jour le label avec le nom du paramètre
+                    Dim zp2lbl As ZString * 32 : zp2lbl = p2lbl & " :"
+                    SetWindowText(hLbl2, @zp2lbl)
+                    Dim curP2 As ZString * 8 : curP2 = Str(ap.param2)
+                    SetWindowText(hEdit2, @curP2)
+
+                    ' Rendre visibles
+                    ShowWindow(hLbl2,  SW_SHOW)
+                    ShowWindow(hEdit2, SW_SHOW)
+
+                    ' Déplacer le bouton OK plus bas et agrandir la fenêtre
+                    SetWindowPos(hOK, NULL, 75, 76, 70, 26, SWP_NOZORDER)
+                    SetWindowPos(hWnd, NULL, 0, 0, 215, 140, SWP_NOMOVE Or SWP_NOZORDER)
+                Else
+                    ' Garder cachés, bouton OK à sa position normale
+                    ShowWindow(hLbl2,  SW_HIDE)
+                    ShowWindow(hEdit2, SW_HIDE)
+                    SetWindowPos(hOK, NULL, 75, 46, 70, 26, SWP_NOZORDER)
+                    SetWindowPos(hWnd, NULL, 0, 0, 215, 110, SWP_NOMOVE Or SWP_NOZORDER)
+                End If
+            End If
+
             SetFocus(hEdit)
 
         Case WM_COMMAND
-            Dim cmdId As Integer = Loword(wParam)
+            Dim cmdId  As Integer = Loword(wParam)
             Dim cmdEvt As Integer = Hiword(wParam)
-            ' OK cliqué, ou Entrée dans l'EditBox (EN_DEFAULT = notification 1)
-            If cmdId = IDOK Or (cmdId = ID_EDT_PERIOD And cmdEvt = 1) Then
+
+            ' OK cliqué ou Entrée dans l'un des editbox
+            Dim isConfirm As Integer = 0
+            If cmdId = IDOK Then isConfirm = 1
+            If cmdId = ID_EDT_PERIOD  And cmdEvt = 1 Then isConfirm = 1  ' EN_DEFAULT
+            If cmdId = ID_EDT_PERIOD2 And cmdEvt = 1 Then isConfirm = 1
+
+            If isConfirm Then
+                ' Lire periode
                 Dim eBuf As ZString * 8
                 GetWindowText(hEdit, @eBuf, 8)
                 Dim newPer As Long = Val(eBuf)
                 If newPer < 2   Then newPer = 2
-                If newPer > 999 Then newPer = 999
+                If newPer > 9999 Then newPer = 9999
+
+                ' Lire param2 (0 si champ caché)
+                Dim newP2 As Long = 0
+                If IsWindowVisible(hEdit2) Then
+                    Dim eBuf2 As ZString * 8
+                    GetWindowText(hEdit2, @eBuf2, 8)
+                    newP2 = Val(eBuf2)
+                    If newP2 < 0    Then newP2 = 0
+                    If newP2 > 9999 Then newP2 = 9999
+                End If
+
                 If rightClickedOverlayIdx >= 0 And rightClickedOverlayIdx < ActiveCount Then
+                    ' Mise à jour globale
                     ActivePanels(rightClickedOverlayIdx).period = newPer
-                    ' Propager au graphe actif
+                    ActivePanels(rightClickedOverlayIdx).param2 = newP2
+
+                    ' Propagation au graphe actif
                     Dim pCDP As ChartWinData Ptr = GetChartData(hCharts(activeChartIdx))
                     If pCDP <> NULL And rightClickedOverlayIdx < pCDP->ActiveCount Then
                         pCDP->ActivePanels(rightClickedOverlayIdx).period = newPer
+                        pCDP->ActivePanels(rightClickedOverlayIdx).param2 = newP2
                     End If
+
                     ForceRedraw(GetWindow(hWnd, GW_OWNER))
                 End If
                 DestroyWindow(hWnd)
@@ -2267,6 +2348,7 @@ Function ParamsDlgProc(hWnd As HWND, uMsg As UINT, wParam As WPARAM, lParam As L
 
         Case WM_CLOSE
             DestroyWindow(hWnd)
+
     End Select
     Return DefWindowProc(hWnd, uMsg, wParam, lParam)
 End Function
